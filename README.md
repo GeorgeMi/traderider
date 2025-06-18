@@ -1,1 +1,3 @@
-# traderider
+# TradeRider - Automated Investment Bot
+
+Usage instructions...
