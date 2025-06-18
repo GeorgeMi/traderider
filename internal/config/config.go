@@ -13,7 +13,11 @@ type Config struct {
 		SecretKey  string `yaml:"secret_key"`
 		UseTestnet bool   `yaml:"use_testnet"`
 	} `yaml:"binance"`
-	Mode string `yaml:"mode"` // "demo" or "real"
+	Mode     string `yaml:"mode"` // "demo" or "real"
+	Strategy struct {
+		MaxHoldingMinutes   int     `yaml:"max_holding_minutes"`
+		MinHoldingThreshold float64 `yaml:"min_holding_threshold"` // nou
+	} `yaml:"strategy"`
 }
 
 func Load(path string) *Config {

@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"net/http"
+	"time"
 
 	"traderider/internal/api"
 	"traderider/internal/binance"
@@ -20,7 +21,7 @@ func main() {
 
 	db, err := store.NewStore("traderider.db")
 	if err != nil {
-		log.Fatalf("failed to initialize store: %v", err)
+		log.Fatalf("Failed to initialize store: %v", err)
 	}
 
 	binClient := binance.NewClient(cfg.Binance.APIKey, cfg.Binance.SecretKey)
@@ -38,8 +39,22 @@ func main() {
 	go mw.Start()
 
 	se := strategy.NewEngine(5, 20, 0.001)
+	if cfg.Strategy.MaxHoldingMinutes > 0 {
+		se.MaxHoldingDuration = time.Duration(cfg.Strategy.MaxHoldingMinutes) * time.Minute
+		log.Printf("[INFO] Max holding duration set to %d minutes", cfg.Strategy.MaxHoldingMinutes)
+	}
 
-	t := trader.NewTrader(db, mw, se, demo, usdcBalance, 30.0, binClient)
+	t := trader.NewTrader(
+		db,
+		mw,
+		se,
+		demo,
+		usdcBalance,
+		30.0,
+		binClient,
+		cfg.Strategy.MinHoldingThreshold,
+		2*time.Minute,
+	)
 	go t.Run()
 
 	srv := api.NewServer(db.DB, mw)

@@ -1,18 +1,27 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
+    <meta charset="UTF-8" />
     <title>TradeRider Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <style>
         body {
             font-family: Arial, sans-serif;
             padding: 1rem;
-            background: #f4f4f4;
+            background: #121212;
+            color: #e0e0e0;
+            margin: 0;
         }
+
         h1 {
             text-align: center;
+            color: #ffffff;
+            margin-bottom: 2rem;
         }
+
         .cards {
             display: flex;
             flex-wrap: wrap;
@@ -20,35 +29,51 @@
             justify-content: center;
             margin-bottom: 2rem;
         }
+
         .card {
-            background: white;
+            background: #1e1e1e;
             padding: 1rem;
             border-radius: 8px;
-            box-shadow: 0 0 10px rgba(0,0,0,0.05);
-            min-width: 180px;
+            box-shadow: 0 0 10px rgba(255,255,255,0.05);
+            flex: 1 1 150px;
             text-align: center;
         }
+
         canvas {
             display: block;
-            margin: 0 auto 1rem;
+            width: 100%;
+            height: 400px;
+            background-color: #1a1a1a;
+            border-radius: 8px;
         }
+
         table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 1rem;
-            background: white;
+            background: #1e1e1e;
+            color: #ffffff;
         }
+
         th, td {
             padding: 8px;
-            border: 1px solid #ccc;
+            border: 1px solid #444;
             text-align: center;
         }
+
         th {
-            background-color: #f2f2f2;
+            background-color: #2a2a2a;
         }
+
         #chartStatus {
             text-align: center;
-            color: red;
+            color: #ff6b6b;
+        }
+
+        @media (max-width: 768px) {
+            .cards {
+                flex-direction: column;
+                align-items: center;
+            }
         }
     </style>
 </head>
@@ -66,7 +91,7 @@
     <div class="card"><strong>Total Invested</strong><div id="usdcInvestedTotal">0</div></div>
 </div>
 
-<canvas id="priceChart" width="1000" height="400"></canvas>
+<canvas id="priceChart"></canvas>
 <p id="chartStatus" style="display: none;">No chart data available.</p>
 
 <table>
@@ -92,8 +117,7 @@
                 document.getElementById('totalValue').textContent = summary.totalValue?.toFixed(2);
                 document.getElementById('usdcBalance').textContent = summary.usdcBalance?.toFixed(2);
                 document.getElementById('usdcInvestedTotal').textContent = summary.usdcInvestedTotal?.toFixed(2);
-            })
-            .catch(e => console.error("Failed to load summary:", e));
+            });
     }
 
     function loadTransactions() {
@@ -112,67 +136,138 @@
                     </tr>`;
                     tbody.innerHTML += row;
                 });
-            })
-            .catch(e => console.error("Failed to load transactions:", e));
+            });
     }
 
     function loadChart() {
         fetch('/api/chart-data')
             .then(res => res.json())
             .then(data => {
-                const points = Array.isArray(data.points) ? data.points : [];
+                const prices = data.prices || [];
+                const transactions = data.transactions || [];
                 const currentPrice = data.currentPrice;
 
-                if (points.length === 0) {
+                if (prices.length === 0) {
                     document.getElementById("chartStatus").style.display = "block";
                     return;
                 }
-
                 document.getElementById("chartStatus").style.display = "none";
 
-                const labels = points.map(p => p.time);
-                const prices = points.map(p => p.price);
-                const emaShort = points.map(p => p.emaShort ?? null);
-                const emaLong = points.map(p => p.emaLong ?? null);
-                const buyPoints = points.map(p => p.side === "BUY" ? p.price : null);
-                const sellPoints = points.map(p => p.side === "SELL" ? p.price : null);
+                const priceData = prices.map(p => ({ x: p.time, y: p.price }));
+                const currentLine = prices.map(p => ({ x: p.time, y: currentPrice }));
 
-                const currentLine = points.map(() => currentPrice);
+                const buyPoints = transactions
+                    .filter(tx => tx.side === "BUY")
+                    .map(tx => ({ x: tx.time, y: tx.price, amount: tx.amount }));
+
+                const sellPoints = transactions
+                    .filter(tx => tx.side === "SELL")
+                    .map(tx => ({ x: tx.time, y: tx.price, amount: tx.amount }));
 
                 const datasets = [
-                    { label: 'BTC Price', data: prices, borderColor: 'blue', fill: false },
-                    { label: 'EMA (5)', data: emaShort, borderColor: 'green', fill: false },
-                    { label: 'EMA (20)', data: emaLong, borderColor: 'purple', fill: false },
                     {
-                        label: 'BUY', data: buyPoints, backgroundColor: 'green',
-                        pointRadius: 6, pointStyle: 'circle', showLine: false, spanGaps: true
+                        label: 'BTC Price',
+                        data: priceData,
+                        borderColor: 'deepskyblue',
+                        borderWidth: 2,
+                        fill: false,
+                        tension: 0.3
                     },
                     {
-                        label: 'SELL', data: sellPoints, backgroundColor: 'red',
-                        pointRadius: 6, pointStyle: 'triangle', showLine: false, spanGaps: true
+                        label: 'BUY',
+                        type: 'scatter',
+                        data: buyPoints,
+                        backgroundColor: 'lime',
+                        pointRadius: 5,
+                        pointStyle: 'circle'
                     },
                     {
-                        label: 'Current Price', data: currentLine, borderColor: 'black',
-                        borderDash: [5, 5], fill: false, pointRadius: 0
+                        label: 'SELL',
+                        type: 'scatter',
+                        data: sellPoints,
+                        backgroundColor: 'tomato',
+                        pointRadius: 5,
+                        pointStyle: 'triangle'
+                    },
+                    {
+                        label: 'Current Price',
+                        data: currentLine,
+                        borderColor: 'gray',
+                        borderDash: [4, 4],
+                        fill: false,
+                        pointRadius: 0,
+                        borderWidth: 1
                     }
                 ];
+
+                const options = {
+                    responsive: true,
+                    animation: false,
+                    interaction: {
+                        mode: 'nearest',
+                        intersect: false
+                    },
+                    plugins: {
+                        zoom: {
+                            pan: { enabled: true, mode: 'x' },
+                            zoom: {
+                                wheel: { enabled: true },
+                                pinch: { enabled: true },
+                                mode: 'x'
+                            }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function (context) {
+                                    const point = context.raw;
+                                    if (point && point.amount !== undefined) {
+                                        return `${context.dataset.label}: ${point.y.toFixed(2)} USD, ${point.amount.toFixed(6)} BTC`;
+                                    }
+                                    return `${context.dataset.label}: ${point.y.toFixed(2)} USD`;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                tooltipFormat: 'HH:mm:ss',
+                                displayFormats: {
+                                    second: 'HH:mm:ss',
+                                    minute: 'HH:mm'
+                                }
+                            },
+                            ticks: {
+                                color: '#aaa',
+                                autoSkip: true,
+                                maxTicksLimit: 20
+                            }
+                        },
+                        y: {
+                            ticks: { color: '#aaa' }
+                        }
+                    }
+                };
 
                 if (!chart) {
                     const ctx = document.getElementById('priceChart').getContext('2d');
                     chart = new Chart(ctx, {
                         type: 'line',
-                        data: { labels, datasets },
-                        options: { responsive: true, animation: false }
+                        data: {
+                            labels: priceData.map(p => p.x),
+                            datasets
+                        },
+                        options
                     });
                 } else {
-                    chart.data.labels = labels;
+                    chart.data.labels = priceData.map(p => p.x);
                     chart.data.datasets.forEach((ds, i) => {
-                        chart.data.datasets[i].data = datasets[i].data;
+                        ds.data = datasets[i].data;
                     });
                     chart.update();
                 }
-            })
-            .catch(e => console.error("Failed to load chart data:", e));
+            });
     }
 
     function refreshAll() {
@@ -184,5 +279,6 @@
     refreshAll();
     setInterval(refreshAll, 5000);
 </script>
+
 </body>
 </html>

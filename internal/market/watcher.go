@@ -22,7 +22,7 @@ func NewWatcher(demo bool, binClient *binance.Client) *MarketWatcher {
 	return &MarketWatcher{
 		price:   30000.0,
 		symbol:  "BTCUSDC",
-		maxLen:  20,
+		maxLen:  300, // last 10 minutes
 		demo:    demo,
 		binance: binClient,
 	}
@@ -30,7 +30,7 @@ func NewWatcher(demo bool, binClient *binance.Client) *MarketWatcher {
 
 func (m *MarketWatcher) Start() {
 	for {
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second) // more responsive updates
 
 		m.mu.Lock()
 		if m.demo {
@@ -39,6 +39,7 @@ func (m *MarketWatcher) Start() {
 			p := m.binance.GetBTCPrice()
 			if p > 0 {
 				m.price = p
+				// fmt.Printf("[MARKET] Price updated: %.2f\n", p)
 			}
 		}
 
