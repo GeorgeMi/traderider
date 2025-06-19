@@ -9,86 +9,90 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <style>
         body {
-            font-family: Arial, sans-serif;
-            padding: 1rem;
-            background: #121212;
-            color: #e0e0e0;
             margin: 0;
+            font-family: system-ui, sans-serif;
+            background: #111;
+            color: #eee;
+            padding: 1rem;
         }
 
         h1 {
             text-align: center;
-            color: #ffffff;
-            margin-bottom: 2rem;
+            margin-bottom: 1.5rem;
+            font-size: 2rem;
+            color: #00eaff;
         }
 
         .cards {
-            display: flex;
-            flex-wrap: wrap;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
             gap: 1rem;
-            justify-content: center;
             margin-bottom: 2rem;
         }
 
         .card {
-            background: #1e1e1e;
+            background: #1c1c1c;
+            border-radius: 12px;
             padding: 1rem;
-            border-radius: 8px;
-            box-shadow: 0 0 10px rgba(255,255,255,0.05);
-            flex: 1 1 150px;
+            box-shadow: 0 0 10px rgba(0, 234, 255, 0.1);
             text-align: center;
         }
 
-        canvas {
+        .card strong {
             display: block;
+            margin-bottom: 0.5rem;
+            color: #ccc;
+        }
+
+        canvas {
+            background: #1c1c1c;
+            border-radius: 12px;
             width: 100%;
             height: 400px;
-            background-color: #1a1a1a;
-            border-radius: 8px;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            background: #1e1e1e;
-            color: #ffffff;
+            background: #1c1c1c;
+            color: #eee;
+            border-radius: 8px;
+            overflow: hidden;
         }
 
         th, td {
-            padding: 8px;
-            border: 1px solid #444;
+            padding: 0.75rem;
             text-align: center;
+            border-bottom: 1px solid #333;
         }
 
         th {
-            background-color: #2a2a2a;
+            background: #2a2a2a;
+        }
+
+        tr:hover {
+            background: #2c2c2c;
         }
 
         #chartStatus {
             text-align: center;
             color: #ff6b6b;
-        }
-
-        @media (max-width: 768px) {
-            .cards {
-                flex-direction: column;
-                align-items: center;
-            }
+            margin: 1rem 0;
         }
     </style>
 </head>
 <body>
 
-<h1>TradeRider Dashboard</h1>
+<h1>🚀 TradeRider Dashboard</h1>
 
 <div class="cards">
     <div class="card"><strong>BTC Held</strong><div id="btcHeld">0</div></div>
-    <div class="card"><strong>BTC Value Now</strong><div id="usdcInvested">0</div></div>
+    <div class="card"><strong>BTC Value Now</strong><div id="investedNow">0</div></div>
     <div class="card"><strong>Profit Realized</strong><div id="usdcProfit">0</div></div>
     <div class="card"><strong>Unrealized Profit</strong><div id="unrealized">0</div></div>
     <div class="card"><strong>Total Wallet Value</strong><div id="totalValue">0</div></div>
     <div class="card"><strong>USDC Available</strong><div id="usdcBalance">0</div></div>
-    <div class="card"><strong>Total Invested</strong><div id="usdcInvestedTotal">0</div></div>
+    <div class="card"><strong>Total Invested</strong><div id="usdcInvested">0</div></div>
 </div>
 
 <canvas id="priceChart"></canvas>
@@ -111,12 +115,12 @@
             .then(res => res.json())
             .then(summary => {
                 document.getElementById('btcHeld').textContent = summary.btcHeld?.toFixed(4);
-                document.getElementById('usdcInvested').textContent = summary.investedNow?.toFixed(2);
+                document.getElementById('investedNow').textContent = summary.investedNow?.toFixed(2);
                 document.getElementById('usdcProfit').textContent = summary.usdcProfit?.toFixed(2);
                 document.getElementById('unrealized').textContent = summary.unrealized?.toFixed(2);
                 document.getElementById('totalValue').textContent = summary.totalValue?.toFixed(2);
                 document.getElementById('usdcBalance').textContent = summary.usdcBalance?.toFixed(2);
-                document.getElementById('usdcInvestedTotal').textContent = summary.usdcInvestedTotal?.toFixed(2);
+                document.getElementById('usdcInvested').textContent = summary.usdcInvested?.toFixed(2);
             });
     }
 
