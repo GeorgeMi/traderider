@@ -38,6 +38,43 @@ type Trader struct {
 	minHoldDuration     time.Duration
 }
 
+// Getters and Setters for restoring state
+type StateSnapshot struct {
+	AssetHeld       float64
+	USDCInvested    float64
+	AverageBuyPrice float64
+	TrailingHigh    float64
+	Entries         int
+	Holding         bool
+	LastSellPrice   float64
+	LastSellTime    time.Time
+}
+
+func (t *Trader) SnapshotState() StateSnapshot {
+	return StateSnapshot{
+		AssetHeld:       t.assetHeld,
+		USDCInvested:    t.usdcInvested,
+		AverageBuyPrice: t.averageBuyPrice,
+		TrailingHigh:    t.trailingHigh,
+		Entries:         t.entries,
+		Holding:         t.holding,
+		LastSellPrice:   t.lastSellPrice,
+		LastSellTime:    t.lastSellTime,
+	}
+}
+
+func (t *Trader) RestoreState(s StateSnapshot) {
+	t.assetHeld = s.AssetHeld
+	t.usdcInvested = s.USDCInvested
+	t.averageBuyPrice = s.AverageBuyPrice
+	t.trailingHigh = s.TrailingHigh
+	t.entries = s.Entries
+	t.holding = s.Holding
+	t.lastSellPrice = s.LastSellPrice
+	t.lastSellTime = s.LastSellTime
+}
+
+// NewTrader initializes a new Trader instance.
 func NewTrader(
 	db *store.Store,
 	mw *market.MarketWatcher,
@@ -67,6 +104,7 @@ func NewTrader(
 	}
 }
 
+// Run continuously evaluates market conditions and executes buy/sell logic.
 func (t *Trader) Run() {
 	for {
 		time.Sleep(5 * time.Second)
@@ -90,6 +128,7 @@ func (t *Trader) Run() {
 	}
 }
 
+// updateBalances updates real USDC and asset balances if not in demo mode.
 func (t *Trader) updateBalances() {
 	if !t.demo {
 		if realUSDC, err := t.binClient.GetUSDCBalance(); err == nil {
@@ -102,12 +141,14 @@ func (t *Trader) updateBalances() {
 	}
 }
 
+// checkSafety logs a warning if total value drops significantly.
 func (t *Trader) checkSafety(value float64) {
 	if value < t.dailyStartValue*0.75 {
 		fmt.Printf("[WARNING] [%s] Total value %.2f dropped below 75%% of initial %.2f\n", t.Symbol, value, t.dailyStartValue)
 	}
 }
 
+// resetIfInvalid resets state if asset held is too small to be valid.
 func (t *Trader) resetIfInvalid(price float64) {
 	if t.holding && t.assetHeld > 0 && t.assetHeld < t.minHoldingThreshold {
 		notional := t.assetHeld * price
@@ -120,6 +161,7 @@ func (t *Trader) resetIfInvalid(price float64) {
 	}
 }
 
+// inCooldown checks whether the trader is still in cooldown after a sale.
 func (t *Trader) inCooldown() bool {
 	if time.Since(t.lastSellTime) < t.cooldownDuration {
 		fmt.Printf("[COOLDOWN] [%s] %.0fs remaining\n", t.Symbol, (t.cooldownDuration - time.Since(t.lastSellTime)).Seconds())
@@ -128,12 +170,14 @@ func (t *Trader) inCooldown() bool {
 	return false
 }
 
+// canBuy determines if conditions are met to place a buy order.
 func (t *Trader) canBuy(price float64, history []float64) bool {
 	buyPrice := t.averageBuyPrice
 	return (!t.holding || (t.entries < t.maxEntries && price < buyPrice*0.96)) &&
 		t.se.ShouldBuy(price, history, t.lastSellPrice)
 }
 
+// tryBuy executes a market buy if conditions are met.
 func (t *Trader) tryBuy(price float64) {
 	if t.usdcBalance < t.investmentPerTrade {
 		fmt.Printf("[SKIP] [%s] Not enough USDC (%.2f < %.2f)\n", t.Symbol, t.usdcBalance, t.investmentPerTrade)
@@ -170,6 +214,7 @@ func (t *Trader) tryBuy(price float64) {
 	fmt.Printf("[TRADE] [%s] Bought at %.2f (%.2f USDC)\n", t.Symbol, price, notional)
 }
 
+// canSell determines if conditions are met to place a sell order.
 func (t *Trader) canSell(price float64, history []float64) bool {
 	if !t.holding || t.assetHeld <= 0 {
 		return false
@@ -212,6 +257,7 @@ func (t *Trader) canSell(price float64, history []float64) bool {
 	return price < trailingStop || t.se.ShouldSell(price, buyPrice, history)
 }
 
+// trySell executes a market sell if conditions are met.
 func (t *Trader) trySell(price float64) {
 	sellAmount := roundQuantity(t.assetHeld, 0.000001)
 	if sellAmount <= 0 {
@@ -233,7 +279,6 @@ func (t *Trader) trySell(price float64) {
 			return
 		}
 	}
-
 	t.assetHeld = 0
 	t.holding = false
 	t.usdcBalance += usdcReturn
@@ -252,6 +297,7 @@ func (t *Trader) trySell(price float64) {
 		grossProfit*100, netProfit*100, holdingTime.Minutes())
 }
 
+// resetState clears the trader state when invalid or after selling.
 func (t *Trader) resetState() {
 	t.assetHeld = 0
 	t.holding = false
@@ -261,14 +307,17 @@ func (t *Trader) resetState() {
 	t.usdcInvested = 0
 }
 
+// totalValue returns the current portfolio value (USDC + asset).
 func (t *Trader) totalValue(price float64) float64 {
 	return t.usdcBalance + t.assetHeld*price
 }
 
+// roundQuantity ensures buy/sell amounts are rounded properly.
 func roundQuantity(quantity float64, step float64) float64 {
 	return math.Floor(quantity/step) * step
 }
 
+// Summary returns the current trading summary.
 func (t *Trader) Summary(price float64) map[string]float64 {
 	unrealized := t.assetHeld * price
 	return map[string]float64{

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
-    <title>TradeRider Dashboard</title>
+    <title>TradeRider</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -12,38 +12,46 @@
             font-family: system-ui, sans-serif;
             background: #111;
             color: #eee;
-            padding: 1rem;
         }
-        h1 {
-            text-align: center;
-            margin-bottom: 1rem;
-            font-size: 2rem;
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem;
+            background: #1c1c1c;
+            box-shadow: 0 0 10px rgba(0, 234, 255, 0.1);
+        }
+        .topbar h1 {
+            margin: 0;
             color: #00eaff;
         }
-        .selector {
-            text-align: center;
-            margin-bottom: 2rem;
+        .topbar .controls {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
         }
-        .selector select {
-            font-size: 1rem;
-            padding: 0.5rem 1rem;
+        .topbar button, .topbar select {
             background: #222;
-            color: #eee;
-            border-radius: 8px;
             border: 1px solid #444;
+            color: #eee;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
         }
+        .hidden { display: none; }
         .cards {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
             gap: 1rem;
-            margin-bottom: 2rem;
+            margin: 1rem;
         }
         .card {
             background: #1c1c1c;
             border-radius: 12px;
             padding: 1rem;
-            box-shadow: 0 0 10px rgba(0, 234, 255, 0.1);
             text-align: center;
+            box-shadow: 0 0 10px rgba(0, 234, 255, 0.1);
         }
         .card strong {
             display: block;
@@ -55,6 +63,7 @@
             border-radius: 12px;
             width: 100%;
             height: 400px;
+            margin: 1rem 0;
         }
         table {
             width: 100%;
@@ -63,7 +72,7 @@
             color: #eee;
             border-radius: 8px;
             overflow: hidden;
-            margin-bottom: 2rem;
+            margin: 1rem;
         }
         th, td {
             padding: 0.75rem;
@@ -84,154 +93,199 @@
     </style>
 </head>
 <body>
-<h1>TradeRider Dashboard</h1>
-
-<div class="selector">
-    <label for="symbol">Select Symbol: </label>
-    <select id="symbol">
-        <option value="BTCUSDC">BTCUSDC</option>
-        <option value="XRPUSDC">XRPUSDC</option>
-    </select>
+<div class="topbar">
+    <h1>TradeRider</h1>
+    <div class="controls">
+        <select id="symbol"></select>
+        <button id="switchBtn" onclick="switchMode()">Transactions</button>
+    </div>
 </div>
 
-<div class="cards">
-    <div class="card"><strong>Asset Held</strong><div id="assetHeld">0</div></div>
-    <div class="card"><strong>Value Now</strong><div id="investedNow">0</div></div>
-    <div class="card"><strong>Profit Realized</strong><div id="usdcProfit">0</div></div>
-    <div class="card"><strong>Unrealized Profit</strong><div id="unrealized">0</div></div>
-    <div class="card"><strong>Total Wallet Value</strong><div id="totalValue">0</div></div>
-    <div class="card"><strong>USDC Available</strong><div id="usdcBalance">0</div></div>
-    <div class="card"><strong>Total Invested</strong><div id="usdcInvested">0</div></div>
+<div id="classic-view">
+    <div class="cards">
+        <div class="card"><strong>Asset Held</strong><div id="assetHeld">0</div></div>
+        <div class="card"><strong>Value Now</strong><div id="investedNow">0</div></div>
+        <div class="card"><strong>Profit Realized</strong><div id="usdcProfit">0</div></div>
+        <div class="card"><strong>Unrealized Profit</strong><div id="unrealized">0</div></div>
+        <div class="card"><strong>Total Wallet Value</strong><div id="totalValue">0</div></div>
+        <div class="card"><strong>USDC Available</strong><div id="usdcBalance">0</div></div>
+        <div class="card"><strong>Total Invested</strong><div id="usdcInvested">0</div></div>
+    </div>
+    <canvas id="priceChart"></canvas>
+    <p id="chartStatus" style="display: none;">No chart data available.</p>
+    <table>
+        <thead><tr><th>Symbol</th><th>Side</th><th>Amount</th><th>Price</th><th>Time</th></tr></thead>
+        <tbody id="txs"></tbody>
+    </table>
 </div>
 
-<!-- Chart comes first -->
-<canvas id="priceChart"></canvas>
-<p id="chartStatus" style="display: none;">No chart data available.</p>
-
-<!-- Transactions follow -->
-<table>
-    <thead>
-    <tr>
-        <th>Symbol</th><th>Side</th><th>Amount</th><th>Price</th><th>Time</th>
-    </tr>
-    </thead>
-    <tbody id="txs"></tbody>
-</table>
+<div id="smart-view" class="hidden"></div>
 
 <script>
     let chart;
+    let currentMode = 'classic';
+    const symbols = ['BTCUSDC', 'XRPUSDC', 'SOLUSDC', 'LINKUSDC'];
     const symbolSelect = document.getElementById('symbol');
 
-    function loadData(symbol) {
-        fetch(`/api/summary/${symbol}`)
-            .then(res => res.json())
-            .then(summary => {
-                document.getElementById('assetHeld').textContent = summary.assetHeld?.toFixed(4);
-                document.getElementById('investedNow').textContent = summary.investedNow?.toFixed(2);
-                document.getElementById('usdcProfit').textContent = summary.usdcProfit?.toFixed(2);
-                document.getElementById('unrealized').textContent = summary.unrealized?.toFixed(2);
-                document.getElementById('totalValue').textContent = summary.totalValue?.toFixed(2);
-                document.getElementById('usdcBalance').textContent = summary.usdcBalance?.toFixed(2);
-                document.getElementById('usdcInvested').textContent = summary.usdcInvested?.toFixed(2);
+    function switchMode() {
+        currentMode = currentMode === 'classic' ? 'smart' : 'classic';
+        document.getElementById('classic-view').classList.toggle('hidden', currentMode !== 'classic');
+        document.getElementById('smart-view').classList.toggle('hidden', currentMode !== 'smart');
+        document.getElementById('switchBtn').textContent = currentMode === 'classic' ? 'Transactions' : 'Dashboard';
+        updateSymbolOptions();
+        if (currentMode === 'classic') loadClassic(symbolSelect.value);
+        else loadSmart();
+    }
+
+    function updateSymbolOptions() {
+        symbolSelect.innerHTML = '';
+        if (currentMode === 'smart') {
+            const allOption = document.createElement('option');
+            allOption.value = 'ALL';
+            allOption.textContent = 'All';
+            symbolSelect.appendChild(allOption);
+        }
+        symbols.forEach(symbol => {
+            const option = document.createElement('option');
+            option.value = symbol;
+            option.textContent = symbol;
+            symbolSelect.appendChild(option);
+        });
+    }
+
+    function loadClassic(symbol) {
+        fetch(`/api/summary/${symbol}`).then(res => res.json()).then(summary => {
+            document.getElementById('assetHeld').textContent = summary.assetHeld?.toFixed(4);
+            document.getElementById('investedNow').textContent = summary.investedNow?.toFixed(2);
+            document.getElementById('usdcProfit').textContent = summary.usdcProfit?.toFixed(2);
+            document.getElementById('unrealized').textContent = summary.unrealized?.toFixed(2);
+            document.getElementById('totalValue').textContent = summary.totalValue?.toFixed(2);
+            document.getElementById('usdcBalance').textContent = summary.usdcBalance?.toFixed(2);
+            document.getElementById('usdcInvested').textContent = summary.usdcInvested?.toFixed(2);
+        });
+
+        fetch(`/api/transactions/${symbol}`).then(res => res.json()).then(data => {
+            const tbody = document.getElementById('txs');
+            tbody.innerHTML = '';
+            data.forEach(tx => {
+                const time = new Date(tx.time).toLocaleString('ro-RO', { timeZone: 'Europe/Bucharest' });
+                const row = `<tr><td>${tx.symbol}</td><td>${tx.side}</td><td>${tx.amount.toFixed(4)}</td><td>${tx.price.toFixed(2)}</td><td>${time}</td></tr>`;
+                tbody.innerHTML += row;
             });
+        });
 
-        fetch(`/api/transactions/${symbol}`)
-            .then(res => res.json())
-            .then(data => {
-                const tbody = document.getElementById('txs');
-                tbody.innerHTML = '';
-                data.forEach(tx => {
-                    const row = `<tr><td>${tx.symbol}</td><td>${tx.side}</td><td>${tx.amount.toFixed(4)}</td><td>${tx.price.toFixed(2)}</td><td>${tx.time}</td></tr>`;
-                    tbody.innerHTML += row;
-                });
-            });
+        fetch(`/api/chart-data/${symbol}`).then(res => res.json()).then(data => {
+            const prices = data.prices || [];
+            const transactions = data.transactions || [];
+            const currentPrice = data.currentPrice;
+            const validTimes = new Set(prices.map(p => p.time));
+            const priceData = prices.map(p => ({ x: p.time, y: p.price }));
+            const currentLine = prices.map(p => ({ x: p.time, y: currentPrice }));
+            const buyPoints = transactions.filter(tx => tx.side === "BUY" && validTimes.has(tx.time)).map(tx => ({ x: tx.time, y: tx.price, amount: tx.amount }));
+            const sellPoints = transactions.filter(tx => tx.side === "SELL" && validTimes.has(tx.time)).map(tx => ({ x: tx.time, y: tx.price, amount: tx.amount }));
 
-        fetch(`/api/chart-data/${symbol}`)
-            .then(res => res.json())
-            .then(data => {
-                const prices = data.prices || [];
-                const transactions = data.transactions || [];
-                const currentPrice = data.currentPrice;
+            const datasets = [
+                { label: `${symbol} Price`, data: priceData, borderColor: 'deepskyblue', borderWidth: 2, fill: false, tension: 0.3 },
+                { label: 'BUY', type: 'scatter', data: buyPoints, backgroundColor: 'lime', pointRadius: 5, pointStyle: 'circle' },
+                { label: 'SELL', type: 'scatter', data: sellPoints, backgroundColor: 'tomato', pointRadius: 5, pointStyle: 'triangle' },
+                { label: 'Current Price', data: currentLine, borderColor: 'gray', borderDash: [4, 4], fill: false, pointRadius: 0, borderWidth: 1 }
+            ];
 
-                if (prices.length === 0) {
-                    document.getElementById("chartStatus").style.display = "block";
-                    return;
-                }
-                document.getElementById("chartStatus").style.display = "none";
-
-                const validTimes = new Set(prices.map(p => p.time));
-                const priceData = prices.map(p => ({ x: p.time, y: p.price }));
-                const currentLine = prices.map(p => ({ x: p.time, y: currentPrice }));
-
-                const buyPoints = transactions
-                    .filter(tx => tx.side === "BUY" && validTimes.has(tx.time))
-                    .map(tx => ({ x: tx.time, y: tx.price, amount: tx.amount }));
-
-                const sellPoints = transactions
-                    .filter(tx => tx.side === "SELL" && validTimes.has(tx.time))
-                    .map(tx => ({ x: tx.time, y: tx.price, amount: tx.amount }));
-
-                const datasets = [
-                    { label: `${symbol} Price`, data: priceData, borderColor: 'deepskyblue', borderWidth: 2, fill: false, tension: 0.3 },
-                    { label: 'BUY', type: 'scatter', data: buyPoints, backgroundColor: 'lime', pointRadius: 5, pointStyle: 'circle' },
-                    { label: 'SELL', type: 'scatter', data: sellPoints, backgroundColor: 'tomato', pointRadius: 5, pointStyle: 'triangle' },
-                    { label: 'Current Price', data: currentLine, borderColor: 'gray', borderDash: [4, 4], fill: false, pointRadius: 0, borderWidth: 1 }
-                ];
-
-                const options = {
-                    responsive: true,
-                    animation: false,
-                    interaction: { mode: 'nearest', intersect: false },
-                    plugins: {
-                        tooltip: {
-                            callbacks: {
-                                label: function (context) {
-                                    const point = context.raw;
-                                    if (point && point.amount !== undefined) {
-                                        return `${context.dataset.label}: ${point.y.toFixed(2)} USD, ${point.amount.toFixed(6)} units`;
-                                    }
-                                    return `${context.dataset.label}: ${point.y.toFixed(2)} USD`;
-                                }
+            const options = {
+                responsive: true,
+                animation: false,
+                interaction: { mode: 'nearest', intersect: false },
+                plugins: {
+                    tooltip: {
+                        callbacks: {
+                            label: function (context) {
+                                const point = context.raw;
+                                return point?.amount !== undefined ? `${context.dataset.label}: ${point.y.toFixed(2)} USD, ${point.amount.toFixed(6)} units` : `${context.dataset.label}: ${point.y.toFixed(2)} USD`;
                             }
                         }
-                    },
-                    scales: {
-                        x: {
-                            type: 'time',
-                            time: {
-                                tooltipFormat: 'HH:mm:ss',
-                                displayFormats: {
-                                    second: 'HH:mm:ss',
-                                    minute: 'HH:mm'
-                                }
-                            },
-                            ticks: { color: '#aaa', autoSkip: true, maxTicksLimit: 20 }
-                        },
-                        y: {
-                            ticks: { color: '#aaa' }
-                        }
                     }
-                };
-
-                if (!chart) {
-                    const ctx = document.getElementById('priceChart').getContext('2d');
-                    chart = new Chart(ctx, { type: 'line', data: { labels: priceData.map(p => p.x), datasets }, options });
-                } else {
-                    chart.data.labels = priceData.map(p => p.x);
-                    chart.data.datasets.forEach((ds, i) => { ds.data = datasets[i].data });
-                    chart.update();
+                },
+                scales: {
+                    x: {
+                        type: 'time',
+                        time: { tooltipFormat: 'HH:mm:ss', displayFormats: { second: 'HH:mm:ss', minute: 'HH:mm' } },
+                        ticks: { color: '#aaa', autoSkip: true, maxTicksLimit: 20 }
+                    },
+                    y: { ticks: { color: '#aaa' } }
                 }
+            };
+
+            if (!chart) {
+                const ctx = document.getElementById('priceChart').getContext('2d');
+                chart = new Chart(ctx, { type: 'line', data: { labels: priceData.map(p => p.x), datasets }, options });
+            } else {
+                chart.data.labels = priceData.map(p => p.x);
+                chart.data.datasets.forEach((ds, i) => { ds.data = datasets[i].data });
+                chart.update();
+            }
+
+            document.getElementById("chartStatus").style.display = prices.length === 0 ? "block" : "none";
+        });
+    }
+
+    function loadSmart() {
+        const container = document.getElementById('smart-view');
+        container.innerHTML = '';
+
+        const selected = symbolSelect.value;
+        const toLoad = selected === 'ALL' ? symbols.slice() : [selected];
+
+        const promises = toLoad.map(symbol =>
+            fetch(`/api/transactions/${symbol}`)
+                .then(res => res.json())
+                .then(data => ({
+                    symbol,
+                    data,
+                    price: data.length > 0 ? data[0].price : Infinity
+                }))
+        );
+
+        Promise.all(promises).then(results => {
+            // Sortează simbolurile după preț crescător
+            results.sort((a, b) => a.price - b.price);
+
+            results.forEach(({ symbol, data }) => {
+                const section = document.createElement('div');
+                section.innerHTML = `
+                <h2>${symbol}</h2>
+                <table>
+                    <thead><tr><th>Side</th><th>Amount</th><th>Price</th><th>Time</th></tr></thead>
+                    <tbody id="txs-${symbol}"></tbody>
+                </table>`;
+                container.appendChild(section);
+
+                const tbody = document.getElementById(`txs-${symbol}`);
+                data.forEach(tx => {
+                    const time = new Date(tx.time).toLocaleString('ro-RO', { timeZone: 'Europe/Bucharest' });
+                    const row = document.createElement('tr');
+                    row.innerHTML = `<td>${tx.side}</td><td>${tx.amount.toFixed(4)}</td><td>${tx.price.toFixed(2)}</td><td>${time}</td>`;
+                    tbody.appendChild(row);
+                });
             });
+        });
     }
 
     symbolSelect.addEventListener('change', () => {
-        chart?.destroy();
-        chart = null;
-        loadData(symbolSelect.value);
+        if (currentMode === 'classic') {
+            chart?.destroy();
+            chart = null;
+            loadClassic(symbolSelect.value);
+        } else {
+            loadSmart();
+        }
     });
 
-    loadData(symbolSelect.value);
-    setInterval(() => loadData(symbolSelect.value), 5000);
+    updateSymbolOptions();
+    loadClassic(symbols[0]);
+    setInterval(() => {
+        if (currentMode === 'smart') loadSmart();
+        else loadClassic(symbolSelect.value);
+    }, 10000);
 </script>
 </body>
 </html>

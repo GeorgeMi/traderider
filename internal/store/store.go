@@ -37,3 +37,21 @@ func (s *Store) LogTransaction(symbol, side string, amount, price float64) error
 		symbol, side, amount, price)
 	return err
 }
+
+// GetLastBuyTransaction returns the most recent BUY transaction for a given symbol.
+func (s *Store) GetLastBuyTransaction(symbol string) (float64, float64, error) {
+	row := s.DB.QueryRow(`
+        SELECT amount, price 
+        FROM transactions 
+        WHERE symbol = ? AND side = 'BUY' 
+        ORDER BY time DESC 
+        LIMIT 1
+    `, symbol)
+
+	var amount, price float64
+	err := row.Scan(&amount, &price)
+	if err != nil {
+		return 0, 0, err
+	}
+	return amount, price, nil
+}
