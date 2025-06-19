@@ -28,12 +28,6 @@ func NewClient(apiKey, secretKey string) *Client {
 		symbolFilters: make(map[string]SymbolFilter),
 	}
 	client.loadSymbolFilters()
-
-	// Log filters for primary symbol (e.g. BTCUSDC)
-	filter := client.GetSymbolFilter("BTCUSDC")
-	log.Printf("[FILTER] BTCUSDC: minQty=%.8f, stepSize=%.8f, minNotional=%.2f",
-		filter.MinQty, filter.StepSize, filter.MinNotional)
-
 	return client
 }
 
@@ -43,7 +37,6 @@ func (c *Client) loadSymbolFilters() {
 		log.Printf("[ERROR] Failed to load exchange info: %v", err)
 		return
 	}
-
 	for _, sym := range info.Symbols {
 		var minQty, stepSize, minNotional float64
 		for _, filter := range sym.Filters {
@@ -69,17 +62,43 @@ func (c *Client) loadSymbolFilters() {
 	}
 }
 
+func (c *Client) GetSymbolPrice(symbol string) float64 {
+	res, err := c.api.NewListPricesService().Symbol(symbol).Do(context.Background())
+	if err != nil || len(res) == 0 {
+		log.Printf("[ERROR] Binance price error for %s: %v", symbol, err)
+		return 0
+	}
+	price, _ := strconv.ParseFloat(res[0].Price, 64)
+	return price
+}
+
+func (c *Client) GetAssetBalance(asset string) (float64, error) {
+	account, err := c.api.NewGetAccountService().Do(context.Background())
+	if err != nil {
+		log.Printf("[ERROR] Binance account error: %v", err)
+		return 0, err
+	}
+	for _, b := range account.Balances {
+		if b.Asset == asset {
+			return strconv.ParseFloat(b.Free, 64)
+		}
+	}
+	return 0, nil
+}
+
+func (c *Client) GetUSDCBalance() (float64, error) {
+	return c.GetAssetBalance("USDC")
+}
+
 func (c *Client) adjustQuantity(symbol string, quantity float64) float64 {
 	filter, ok := c.symbolFilters[symbol]
 	if !ok || filter.StepSize == 0 {
 		return quantity
 	}
-
 	rawSteps := quantity / filter.StepSize
 	if rawSteps < 1 {
 		return 0
 	}
-
 	adjusted := math.Floor(rawSteps) * filter.StepSize
 	if adjusted < filter.MinQty {
 		log.Printf("[ADJUST] Quantity %.8f is below MinQty %.8f, proceeding anyway", adjusted, filter.MinQty)
@@ -91,7 +110,6 @@ func (c *Client) GetSymbolFilter(symbol string) SymbolFilter {
 	if filter, ok := c.symbolFilters[symbol]; ok {
 		return filter
 	}
-	// Return default values if symbol filter is not found
 	return SymbolFilter{
 		MinQty:      0.00001000,
 		StepSize:    0.00000001,
@@ -99,49 +117,11 @@ func (c *Client) GetSymbolFilter(symbol string) SymbolFilter {
 	}
 }
 
-func (c *Client) GetBTCPrice() float64 {
-	res, err := c.api.NewListPricesService().Symbol("BTCUSDC").Do(context.Background())
-	if err != nil || len(res) == 0 {
-		log.Printf("[ERROR] Binance price error: %v", err)
-		return 0
-	}
-	price, _ := strconv.ParseFloat(res[0].Price, 64)
-	return price
-}
-
-func (c *Client) GetUSDCBalance() (float64, error) {
-	account, err := c.api.NewGetAccountService().Do(context.Background())
-	if err != nil {
-		log.Printf("[ERROR] Binance account error: %v", err)
-		return 0, err
-	}
-	for _, b := range account.Balances {
-		if b.Asset == "USDC" {
-			return strconv.ParseFloat(b.Free, 64)
-		}
-	}
-	return 0, nil
-}
-
-func (c *Client) GetBTCBalance() (float64, error) {
-	account, err := c.api.NewGetAccountService().Do(context.Background())
-	if err != nil {
-		return 0, err
-	}
-	for _, b := range account.Balances {
-		if b.Asset == "BTC" {
-			return strconv.ParseFloat(b.Free, 64)
-		}
-	}
-	return 0, nil
-}
-
 func (c *Client) MarketBuy(symbol string, quantity float64) error {
 	quantity = c.adjustQuantity(symbol, quantity)
 	if quantity <= 0 {
 		return fmt.Errorf("quantity after adjustment is 0 or below minQty for symbol %s", symbol)
 	}
-
 	order, err := c.api.NewCreateOrderService().
 		Symbol(symbol).
 		Side(binance.SideTypeBuy).
@@ -160,7 +140,6 @@ func (c *Client) MarketSell(symbol string, quantity float64) error {
 	if quantity <= 0 {
 		return fmt.Errorf("quantity after adjustment is 0 or below minQty for symbol %s", symbol)
 	}
-
 	order, err := c.api.NewCreateOrderService().
 		Symbol(symbol).
 		Side(binance.SideTypeSell).
@@ -174,36 +153,26 @@ func (c *Client) MarketSell(symbol string, quantity float64) error {
 	return nil
 }
 
-// Calculates the maximum valid quantity to buy based on available USDC and Binance rules
 func (c *Client) CalculateBuyQty(symbol string, availableUSDC float64) (float64, error) {
-	price := c.GetBTCPrice()
+	price := c.GetSymbolPrice(symbol)
 	if price == 0 {
 		return 0, fmt.Errorf("price unavailable")
 	}
-
 	filter := c.GetSymbolFilter(symbol)
-
-	// Calculate the minimum quantity required to meet minNotional
 	minQty := filter.MinNotional / price
 	minQty = c.adjustQuantity(symbol, minQty)
-
-	// Check if balance is sufficient for minQty
 	requiredUSDC := minQty * price
 	if availableUSDC < requiredUSDC {
 		log.Printf("[BUY_QTY] Not enough USDC: have %.2f, need %.2f for minQty %.8f", availableUSDC, requiredUSDC, minQty)
 		return 0, fmt.Errorf("not enough USDC: need %.2f for minQty", requiredUSDC)
 	}
-
-	// Use as much of the available balance as possible
 	qty := availableUSDC / price
 	qty = c.adjustQuantity(symbol, qty)
-
 	notional := price * qty
 	if notional < filter.MinNotional {
 		log.Printf("[BUY_QTY] Notional too low: %.2f < %.2f", notional, filter.MinNotional)
 		return 0, fmt.Errorf("notional %.2f below minimum %.2f", notional, filter.MinNotional)
 	}
-
 	return qty, nil
 }
 

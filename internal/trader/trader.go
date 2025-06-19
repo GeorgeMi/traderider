@@ -3,6 +3,7 @@ package trader
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"traderider/internal/binance"
@@ -12,13 +13,14 @@ import (
 )
 
 type Trader struct {
+	Symbol              string
 	db                  *store.Store
 	mw                  *market.MarketWatcher
 	se                  *strategy.StrategyEngine
 	binClient           *binance.Client
 	demo                bool
 	usdcBalance         float64
-	btcHeld             float64
+	assetHeld           float64
 	usdcInvested        float64
 	usdcProfit          float64
 	dailyStartValue     float64
@@ -57,7 +59,7 @@ func NewTrader(
 		dailyStartValue:     usdcBalance,
 		investmentPerTrade:  investmentPerTrade,
 		holding:             false,
-		trailingStopPct:     0.02, // mai permisiv
+		trailingStopPct:     0.02,
 		maxEntries:          3,
 		cooldownDuration:    60 * time.Second,
 		minHoldingThreshold: minHoldingThreshold,
@@ -68,8 +70,8 @@ func NewTrader(
 func (t *Trader) Run() {
 	for {
 		time.Sleep(5 * time.Second)
-		price := t.mw.GetPrice()
-		history := t.mw.GetHistory()
+		price := t.mw.GetPrice(t.Symbol)
+		history := t.mw.GetHistory(t.Symbol)
 		value := t.totalValue(price)
 
 		t.updateBalances()
@@ -93,33 +95,34 @@ func (t *Trader) updateBalances() {
 		if realUSDC, err := t.binClient.GetUSDCBalance(); err == nil {
 			t.usdcBalance = realUSDC
 		}
-		if realBTC, err := t.binClient.GetBTCBalance(); err == nil {
-			t.btcHeld = realBTC
+		asset := strings.Replace(t.Symbol, "USDC", "", 1)
+		if realAsset, err := t.binClient.GetAssetBalance(asset); err == nil {
+			t.assetHeld = realAsset
 		}
 	}
 }
 
 func (t *Trader) checkSafety(value float64) {
 	if value < t.dailyStartValue*0.75 {
-		fmt.Printf("[WARNING] Total portfolio value %.2f dropped below 75%% of initial value %.2f\n", value, t.dailyStartValue)
+		fmt.Printf("[WARNING] [%s] Total value %.2f dropped below 75%% of initial %.2f\n", t.Symbol, value, t.dailyStartValue)
 	}
 }
 
 func (t *Trader) resetIfInvalid(price float64) {
-	if t.holding && t.btcHeld > 0 && t.btcHeld < t.minHoldingThreshold {
-		notional := t.btcHeld * price
+	if t.holding && t.assetHeld > 0 && t.assetHeld < t.minHoldingThreshold {
+		notional := t.assetHeld * price
 		if notional >= 5 {
-			fmt.Printf("[WARNING] BTC holding is low (%.8f), but value %.2f is acceptable — no reset\n", t.btcHeld, notional)
+			fmt.Printf("[INFO] [%s] Low holding (%.8f), but value %.2f is acceptable\n", t.Symbol, t.assetHeld, notional)
 			return
 		}
-		fmt.Printf("[RESET] BTC holding too low (%.8f, %.2f USD), resetting state.\n", t.btcHeld, notional)
+		fmt.Printf("[RESET] [%s] Holding too low (%.8f, %.2f USD), resetting\n", t.Symbol, t.assetHeld, notional)
 		t.resetState()
 	}
 }
 
 func (t *Trader) inCooldown() bool {
 	if time.Since(t.lastSellTime) < t.cooldownDuration {
-		fmt.Printf("[COOLDOWN] Waiting after last sell: %.0fs remaining\n", (t.cooldownDuration - time.Since(t.lastSellTime)).Seconds())
+		fmt.Printf("[COOLDOWN] [%s] %.0fs remaining\n", t.Symbol, (t.cooldownDuration - time.Since(t.lastSellTime)).Seconds())
 		return true
 	}
 	return false
@@ -133,25 +136,25 @@ func (t *Trader) canBuy(price float64, history []float64) bool {
 
 func (t *Trader) tryBuy(price float64) {
 	if t.usdcBalance < t.investmentPerTrade {
-		fmt.Printf("[SKIP] Not enough USDC to buy (have %.2f, need %.2f)\n", t.usdcBalance, t.investmentPerTrade)
+		fmt.Printf("[SKIP] [%s] Not enough USDC (%.2f < %.2f)\n", t.Symbol, t.usdcBalance, t.investmentPerTrade)
 		return
 	}
-	amount, err := t.binClient.CalculateBuyQty("BTCUSDC", t.investmentPerTrade)
+	amount, err := t.binClient.CalculateBuyQty(t.Symbol, t.investmentPerTrade)
 	if err != nil || amount <= 0 {
-		fmt.Printf("[SKIP] Cannot buy: %v\n", err)
+		fmt.Printf("[SKIP] [%s] Cannot buy: %v\n", t.Symbol, err)
 		return
 	}
 	notional := amount * price
 	if !t.demo {
-		if err := t.binClient.MarketBuy("BTCUSDC", amount); err != nil {
-			fmt.Printf("[ERROR] Market Buy failed: %v\n", err)
+		if err := t.binClient.MarketBuy(t.Symbol, amount); err != nil {
+			fmt.Printf("[ERROR] [%s] Market Buy failed: %v\n", t.Symbol, err)
 			return
 		}
 	}
-	t.btcHeld += amount
+	t.assetHeld += amount
 	t.usdcBalance -= notional
 	t.usdcInvested += notional
-	t.averageBuyPrice = t.usdcInvested / t.btcHeld
+	t.averageBuyPrice = t.usdcInvested / t.assetHeld
 	t.trailingHigh = price
 	t.entries++
 	t.holding = true
@@ -159,28 +162,28 @@ func (t *Trader) tryBuy(price float64) {
 	if t.entries == 1 {
 		t.se.LastBuyTime = time.Now()
 	}
-	if t.btcHeld < t.minHoldingThreshold {
-		t.minHoldingThreshold = t.btcHeld * 0.9
-		fmt.Printf("[ADJUST] Lowered minHoldingThreshold to %.8f\n", t.minHoldingThreshold)
+	if t.assetHeld < t.minHoldingThreshold {
+		t.minHoldingThreshold = t.assetHeld * 0.9
+		fmt.Printf("[ADJUST] [%s] Lowered minHoldingThreshold to %.8f\n", t.Symbol, t.minHoldingThreshold)
 	}
-	t.db.LogTransaction("BTCUSDC", "BUY", amount, price)
-	fmt.Printf("[TRADE] Bought BTC at %.2f (%.2f USDC used)\n", price, notional)
+	t.db.LogTransaction(t.Symbol, "BUY", amount, price)
+	fmt.Printf("[TRADE] [%s] Bought at %.2f (%.2f USDC)\n", t.Symbol, price, notional)
 }
 
 func (t *Trader) canSell(price float64, history []float64) bool {
-	if !t.holding || t.btcHeld <= 0 {
+	if !t.holding || t.assetHeld <= 0 {
 		return false
 	}
-	value := t.btcHeld * price
+	value := t.assetHeld * price
 	if value < 5 {
-		fmt.Printf("[SKIP] BTC value %.2f below minNotional\n", value)
+		fmt.Printf("[SKIP] [%s] Position value %.2f below threshold\n", t.Symbol, value)
 		return false
 	}
 
 	buyPrice := t.averageBuyPrice
-	heldDuration := time.Since(t.se.LastBuyTime)
-	if heldDuration < t.minHoldDuration {
-		fmt.Printf("[SKIP] Holding time %.0fs under minHoldDuration (%.0fs)\n", heldDuration.Seconds(), t.minHoldDuration.Seconds())
+	holdingTime := time.Since(t.se.LastBuyTime)
+	if holdingTime < t.minHoldDuration {
+		fmt.Printf("[SKIP] [%s] Holding %.0fs < minHold %.0fs\n", t.Symbol, holdingTime.Seconds(), t.minHoldDuration.Seconds())
 		return false
 	}
 
@@ -193,16 +196,16 @@ func (t *Trader) canSell(price float64, history []float64) bool {
 	grossProfit := (price - buyPrice) / buyPrice
 	netProfit := ((price * (1 - commission)) - (buyPrice * (1 + commission))) / buyPrice
 
-	fmt.Printf("[CHECK] Gross=%.4f%%, Net=%.4f%%, RSI=%.2f, Price=%.2f, TrailingHigh=%.2f, Stop=%.2f\n",
-		grossProfit*100, netProfit*100, t.se.LastRSI, price, t.trailingHigh, trailingStop)
+	fmt.Printf("[CHECK] [%s] Gross=%.4f%%, Net=%.4f%%, RSI=%.2f, Price=%.2f, High=%.2f, Stop=%.2f\n",
+		t.Symbol, grossProfit*100, netProfit*100, t.se.LastRSI, price, t.trailingHigh, trailingStop)
 
 	if netProfit < t.se.MinProfitMargin {
-		fmt.Printf("[SKIP] Net profit %.4f%% below MinProfitMargin %.4f%%\n", netProfit*100, t.se.MinProfitMargin*100)
+		fmt.Printf("[SKIP] [%s] Net profit %.4f%% below target %.4f%%\n", t.Symbol, netProfit*100, t.se.MinProfitMargin*100)
 		return false
 	}
 
 	if t.se.LastRSI > 85 && grossProfit > 0.001 {
-		fmt.Printf("[TRIGGER] RSI>85 and gross profit > 0.1%%: SELL now at %.2f\n", price)
+		fmt.Printf("[TRIGGER] [%s] RSI>85 and profit>0.1%%\n", t.Symbol)
 		return true
 	}
 
@@ -210,9 +213,9 @@ func (t *Trader) canSell(price float64, history []float64) bool {
 }
 
 func (t *Trader) trySell(price float64) {
-	sellAmount := roundQuantity(t.btcHeld, 0.000001)
+	sellAmount := roundQuantity(t.assetHeld, 0.000001)
 	if sellAmount <= 0 {
-		fmt.Println("[SKIP] Sell amount too small.")
+		fmt.Printf("[SKIP] [%s] Sell amount too small\n", t.Symbol)
 		return
 	}
 
@@ -222,16 +225,16 @@ func (t *Trader) trySell(price float64) {
 
 	grossProfit := (price - buyPrice) / buyPrice
 	netProfit := ((price * (1 - commission)) - (buyPrice * (1 + commission))) / buyPrice
-	holdingDuration := time.Since(t.se.LastBuyTime)
+	holdingTime := time.Since(t.se.LastBuyTime)
 
 	if !t.demo {
-		if err := t.binClient.MarketSell("BTCUSDC", sellAmount); err != nil {
-			fmt.Printf("[ERROR] Market Sell failed: %v\n", err)
+		if err := t.binClient.MarketSell(t.Symbol, sellAmount); err != nil {
+			fmt.Printf("[ERROR] [%s] Market Sell failed: %v\n", t.Symbol, err)
 			return
 		}
 	}
 
-	t.btcHeld = 0
+	t.assetHeld = 0
 	t.holding = false
 	t.usdcBalance += usdcReturn
 	t.usdcProfit += usdcReturn - t.usdcInvested
@@ -242,17 +245,15 @@ func (t *Trader) trySell(price float64) {
 	t.lastSellTime = time.Now()
 	t.lastSellPrice = price
 
-	t.db.LogTransaction("BTCUSDC", "SELL", sellAmount, price)
+	t.db.LogTransaction(t.Symbol, "SELL", sellAmount, price)
 
-	fmt.Printf("[TRADE] Sold BTC at %.2f\n", price)
-	fmt.Printf(" - Amount: %.6f BTC (~%.2f USDC)\n", sellAmount, usdcReturn)
-	fmt.Printf(" - Gross profit: %.4f%%\n", grossProfit*100)
-	fmt.Printf(" - Net profit (%.3f%% fee): %.4f%%\n", commission*100, netProfit*100)
-	fmt.Printf(" - Holding duration: %.0f minutes\n", holdingDuration.Minutes())
+	fmt.Printf("[TRADE] [%s] Sold at %.2f | Amount: %.6f | USDC: %.2f\n", t.Symbol, price, sellAmount, usdcReturn)
+	fmt.Printf(" - Gross profit: %.4f%% | Net: %.4f%% | Held: %.0f minutes\n",
+		grossProfit*100, netProfit*100, holdingTime.Minutes())
 }
 
 func (t *Trader) resetState() {
-	t.btcHeld = 0
+	t.assetHeld = 0
 	t.holding = false
 	t.averageBuyPrice = 0
 	t.trailingHigh = 0
@@ -261,7 +262,7 @@ func (t *Trader) resetState() {
 }
 
 func (t *Trader) totalValue(price float64) float64 {
-	return t.usdcBalance + t.btcHeld*price
+	return t.usdcBalance + t.assetHeld*price
 }
 
 func roundQuantity(quantity float64, step float64) float64 {
@@ -269,9 +270,9 @@ func roundQuantity(quantity float64, step float64) float64 {
 }
 
 func (t *Trader) Summary(price float64) map[string]float64 {
-	unrealized := t.btcHeld * price
+	unrealized := t.assetHeld * price
 	return map[string]float64{
-		"btcHeld":           t.btcHeld,
+		"assetHeld":         t.assetHeld,
 		"usdcInvested":      t.usdcInvested,
 		"usdcProfit":        t.usdcProfit,
 		"usdcBalance":       t.usdcBalance,

@@ -12,10 +12,10 @@ import (
 )
 
 type Server struct {
-	DB     *sql.DB
-	Router *mux.Router
-	Market *market.MarketWatcher
-	Trader *trader.Trader
+	DB      *sql.DB
+	Router  *mux.Router
+	Market  *market.MarketWatcher
+	Traders map[string]*trader.Trader
 }
 
 type PricePoint struct {
@@ -30,25 +30,27 @@ type TransactionPoint struct {
 	Amount float64 `json:"amount"`
 }
 
-func NewServer(db *sql.DB, mw *market.MarketWatcher, trader *trader.Trader) *Server {
+func NewServer(db *sql.DB, market *market.MarketWatcher, traders map[string]*trader.Trader) *Server {
 	s := &Server{
-		DB:     db,
-		Market: mw,
-		Trader: trader,
-		Router: mux.NewRouter(),
+		DB:      db,
+		Market:  market,
+		Traders: traders,
+		Router:  mux.NewRouter(),
 	}
 	s.routes()
 	return s
 }
 
 func (s *Server) routes() {
-	s.Router.HandleFunc("/api/transactions", s.handleTransactions).Methods("GET")
-	s.Router.HandleFunc("/api/summary", s.handleSummary).Methods("GET")
-	s.Router.HandleFunc("/api/chart-data", s.handleChartData).Methods("GET")
+	s.Router.HandleFunc("/api/transactions/{symbol}", s.handleTransactions).Methods("GET")
+	s.Router.HandleFunc("/api/summary/{symbol}", s.handleSummary).Methods("GET")
+	s.Router.HandleFunc("/api/chart-data/{symbol}", s.handleChartData).Methods("GET")
 }
 
 func (s *Server) handleTransactions(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.DB.Query("SELECT symbol, side, amount, price, time FROM transactions ORDER BY time DESC LIMIT 50")
+	symbol := mux.Vars(r)["symbol"]
+
+	rows, err := s.DB.Query("SELECT symbol, side, amount, price, time FROM transactions WHERE symbol = ? ORDER BY time DESC LIMIT 50", symbol)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -75,28 +77,40 @@ func (s *Server) handleTransactions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
-	price := s.Market.GetPrice()
-	rawSummary := s.Trader.Summary(price)
+	symbol := mux.Vars(r)["symbol"]
+	tr, ok := s.Traders[symbol]
+	if !ok {
+		http.Error(w, "Unknown symbol", http.StatusBadRequest)
+		return
+	}
+
+	price := s.Market.GetPrice(symbol)
+	rawSummary := tr.Summary(price)
 
 	summary := make(map[string]interface{})
 	for k, v := range rawSummary {
 		summary[k] = v
 	}
 
-	// Enrich summary with additional fields expected by the frontend
+	assetHeld := rawSummary["assetHeld"]
+	usdcInvested := rawSummary["usdcInvested"]
+	usdcProfit := rawSummary["usdcProfit"]
+
 	summary["priceNow"] = price
-	summary["investedNow"] = rawSummary["btcHeld"] * price
-	summary["usdcInvestedTotal"] = rawSummary["usdcInvested"] + rawSummary["usdcProfit"]
+	summary["investedNow"] = assetHeld * price
+	summary["usdcInvestedTotal"] = usdcInvested + usdcProfit
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(summary)
 }
 
 func (s *Server) handleChartData(w http.ResponseWriter, r *http.Request) {
-	history := s.Market.GetHistory()
-	var pricePoints []PricePoint
+	symbol := mux.Vars(r)["symbol"]
+	history := s.Market.GetHistory(symbol)
 
+	var pricePoints []PricePoint
 	startTime := time.Now().Add(-time.Duration(len(history)) * time.Second)
+
 	for i, price := range history {
 		timestamp := startTime.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
 		pricePoints = append(pricePoints, PricePoint{
@@ -105,7 +119,7 @@ func (s *Server) handleChartData(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	txRows, err := s.DB.Query("SELECT time, price, side, amount FROM transactions ORDER BY time ASC")
+	txRows, err := s.DB.Query("SELECT time, price, side, amount FROM transactions WHERE symbol = ? ORDER BY time ASC", symbol)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -130,6 +144,6 @@ func (s *Server) handleChartData(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"prices":       pricePoints,
 		"transactions": txPoints,
-		"currentPrice": s.Market.GetPrice(),
+		"currentPrice": s.Market.GetPrice(symbol),
 	})
 }

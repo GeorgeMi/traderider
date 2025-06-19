@@ -15,62 +15,54 @@ import (
 )
 
 func main() {
-	// Load application configuration
 	cfg := config.Load("config/config.yml")
 	log.Printf("[INFO] Starting TradeRider in %s mode", cfg.Mode)
 
-	// Initialize local store (SQLite)
 	db, err := store.NewStore("traderider.db")
 	if err != nil {
 		log.Fatalf("Failed to initialize store: %v", err)
 	}
 
-	// Initialize Binance client
 	binClient := binance.NewClient(cfg.Binance.APIKey, cfg.Binance.SecretKey)
 	demo := cfg.Mode != "real"
 
-	// Retrieve initial USDC balance (real or fallback)
-	usdcBalance := 1000.0
-	if !demo {
-		if realBalance, err := binClient.GetUSDCBalance(); err == nil {
-			usdcBalance = realBalance
-		} else {
-			log.Printf("[WARN] Could not fetch USDC balance, using default: %v", err)
-		}
+	symbols := []string{"BTCUSDC", "XRPUSDC"}
+
+	// Initialize a shared MarketWatcher for all symbols
+	marketWatcher := market.NewWatcher(demo, binClient)
+	go marketWatcher.Start(symbols)
+
+	// Initialize one Trader per symbol
+	traders := make(map[string]*trader.Trader)
+
+	for _, symbol := range symbols {
+		strategyEngine := strategy.NewEngine(5, 20, cfg.Strategy.MinProfitMargin)
+		strategyEngine.MaxHoldingDuration = time.Duration(cfg.Strategy.MaxHoldingMinutes) * time.Minute
+
+		tr := trader.NewTrader(
+			db,
+			marketWatcher,
+			strategyEngine,
+			demo,
+			cfg.Strategy.InvestmentPerTrade*5,
+			cfg.Strategy.InvestmentPerTrade,
+			binClient,
+			cfg.Strategy.MinHoldingThreshold,
+			time.Duration(cfg.Strategy.MinHoldMinutes)*time.Minute,
+		)
+
+		tr.Symbol = symbol
+		traders[symbol] = tr
+
+		go tr.Run()
+		log.Printf("[INFO] Started trader for %s", symbol)
 	}
 
-	// Start market data watcher
-	mw := market.NewWatcher(demo, binClient)
-	go mw.Start()
-
-	// Configure strategy engine (e.g. EMA 5/20 with 0.5% profit margin)
-	se := strategy.NewEngine(5, 20, 0.005)
-	if cfg.Strategy.MaxHoldingMinutes > 0 {
-		se.MaxHoldingDuration = time.Duration(cfg.Strategy.MaxHoldingMinutes) * time.Minute
-		log.Printf("[INFO] Max holding duration set to %d minutes", cfg.Strategy.MaxHoldingMinutes)
-	}
-
-	// Create and launch trader
-	t := trader.NewTrader(
-		db,
-		mw,
-		se,
-		demo,
-		usdcBalance,
-		cfg.Strategy.InvestmentPerTrade,
-		binClient,
-		cfg.Strategy.MinHoldingThreshold,
-		time.Duration(cfg.Strategy.MinHoldMinutes)*time.Minute,
-	)
-	go t.Run()
-
-	// Start API server
-	srv := api.NewServer(db.DB, mw, t)
-
-	// Setup HTTP routes
+	// Start HTTP server
+	server := api.NewServer(db.DB, marketWatcher, traders)
 	http.Handle("/", http.FileServer(http.Dir("./web")))
-	http.Handle("/api/", srv.Router)
+	http.Handle("/api/", server.Router)
 
-	log.Println("[INFO] TradeRider server running at http://localhost:1010")
+	log.Println("[INFO] TradeRider server is running at http://localhost:1010")
 	log.Fatal(http.ListenAndServe(":1010", nil))
 }
