@@ -8,7 +8,7 @@ import (
 )
 
 type Config struct {
-	Mode string `yaml:"mode"` // Supported values: "demo" or "real"
+	Mode string `yaml:"mode"` // "demo" or "real"
 
 	Binance struct {
 		APIKey     string `yaml:"api_key"`
@@ -17,14 +17,24 @@ type Config struct {
 	} `yaml:"binance"`
 
 	Strategy struct {
-		InvestmentPerTrade  float64 `yaml:"investment_per_trade"`  // Amount to invest per trade (e.g. 20 USDC)
-		MinHoldingThreshold float64 `yaml:"min_holding_threshold"` // Minimum BTC amount to hold (e.g. 0.0002)
-		MinHoldMinutes      int     `yaml:"min_hold_minutes"`      // Minimum duration to hold a position (e.g. 2 minutes)
-		MaxHoldingMinutes   int     `yaml:"max_holding_minutes"`   // Maximum duration to hold a position (e.g. 120 minutes)
-		MinProfitMargin     float64 `yaml:"min_profit_margin"`     // Minimum target profit margin (e.g. 0.005 = 0.5%)
-		SoftStopLoss        float64 `yaml:"soft_stop_loss"`        // Maximum tolerated loss before soft exit (e.g. 0.02 = 2%)
-		MinTradeGapPercent  float64 `yaml:"min_trade_gap_percent"` // Minimum price gap between sell and next buy
+		ShortEMA            int     `yaml:"short_ema"`
+		LongEMA             int     `yaml:"long_ema"`
+		InvestmentPerTrade  float64 `yaml:"investment_per_trade"`
+		MinHoldingThreshold float64 `yaml:"min_holding_threshold"`
+		MinHoldMinutes      int     `yaml:"min_hold_minutes"`
+		MaxHoldingMinutes   int     `yaml:"max_holding_minutes"`
+		MinProfitMargin     float64 `yaml:"min_profit_margin"`
+		SoftStopLoss        float64 `yaml:"soft_stop_loss"`
+		MinTradeGapPercent  float64 `yaml:"min_trade_gap_percent"`
+		UseBollinger        bool    `yaml:"use_bollinger"`
+		BollingerWindow     int     `yaml:"bollinger_window"`
+		CommissionRate      float64 `yaml:"commission_rate"`
 	} `yaml:"strategy"`
+
+	WhatsApp struct {
+		Phone  string `yaml:"phone"`
+		APIKey string `yaml:"apikey"`
+	} `yaml:"whatsapp"`
 }
 
 // Load parses a YAML config file from the given path

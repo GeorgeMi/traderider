@@ -8,8 +8,10 @@ import (
 
 	"traderider/internal/binance"
 	"traderider/internal/market"
+	"traderider/internal/notifier"
 	"traderider/internal/store"
 	"traderider/internal/strategy"
+	"traderider/internal/wallet"
 )
 
 type Trader struct {
@@ -18,8 +20,8 @@ type Trader struct {
 	mw                  *market.MarketWatcher
 	se                  *strategy.StrategyEngine
 	binClient           *binance.Client
+	wallet              *wallet.WalletManager
 	demo                bool
-	usdcBalance         float64
 	assetHeld           float64
 	usdcInvested        float64
 	usdcProfit          float64
@@ -33,12 +35,332 @@ type Trader struct {
 	maxEntries          int
 	lastSellTime        time.Time
 	cooldownDuration    time.Duration
+	minSellInterval     time.Duration
 	lastSellPrice       float64
+	lastSellProfit      float64
 	minHoldingThreshold float64
 	minHoldDuration     time.Duration
+	stopCh              chan struct{}
+	notifier            *notifier.WhatsAppNotifier
 }
 
-// Getters and Setters for restoring state
+func NewTrader(db *store.Store, mw *market.MarketWatcher, se *strategy.StrategyEngine, demo bool, investmentPerTrade float64, binClient *binance.Client, minHoldingThreshold float64, minHoldDuration time.Duration, wallet *wallet.WalletManager, stopCh chan struct{}, notifier *notifier.WhatsAppNotifier) *Trader {
+	return &Trader{
+		db:                  db,
+		mw:                  mw,
+		se:                  se,
+		binClient:           binClient,
+		wallet:              wallet,
+		demo:                demo,
+		investmentPerTrade:  investmentPerTrade,
+		holding:             false,
+		trailingStopPct:     0.02,
+		maxEntries:          3,
+		cooldownDuration:    90 * time.Second,
+		minSellInterval:     12 * time.Minute,
+		minHoldingThreshold: minHoldingThreshold,
+		minHoldDuration:     minHoldDuration,
+		stopCh:              stopCh,
+		notifier:            notifier,
+	}
+}
+
+func (t *Trader) Run() {
+	for {
+		select {
+		case <-t.stopCh:
+			fmt.Printf("[STOPPED] Trader for %s stopped by hard stop\n", t.Symbol)
+			return
+		default:
+		}
+
+		time.Sleep(5 * time.Second)
+		t.updateBalances()
+		if t.dailyStartValue == 0 {
+			continue
+		}
+
+		price := t.mw.GetPrice(t.Symbol)
+		history := t.mw.GetHistory(t.Symbol)
+
+		t.resetIfInvalid(price)
+
+		if t.inCooldown() {
+			continue
+		}
+
+		if t.canBuy(price, history) {
+			t.tryBuy(price)
+		} else if t.canSell(price, history) {
+			t.trySell(price)
+		}
+	}
+}
+
+func (t *Trader) inCooldown() bool {
+	if time.Since(t.lastSellTime) < t.cooldownDuration || t.lastSellProfit < -0.3 {
+		fmt.Printf("[COOLDOWN] [%s] %.0fs remaining\n", t.Symbol, (t.cooldownDuration - time.Since(t.lastSellTime)).Seconds())
+		return true
+	}
+	return false
+}
+
+func (t *Trader) canBuy(price float64, history []float64) bool {
+	if !t.wallet.Reserve(t.investmentPerTrade) {
+		return false
+	}
+
+	if t.holding && (t.entries >= t.maxEntries || price > t.averageBuyPrice*0.96) {
+		t.wallet.Release(t.investmentPerTrade)
+		return false
+	}
+
+	// Așteaptă o scădere semnificativă după SELL
+	if !t.holding && t.lastSellPrice > 0 && price > t.lastSellPrice*(1-0.005) {
+		t.wallet.Release(t.investmentPerTrade)
+		fmt.Printf("[WAIT] [%s] Waiting for price to drop after last SELL (%.2f → %.2f)\n", t.Symbol, t.lastSellPrice, price)
+		return false
+	}
+
+	// Confirmă formarea unui bottom local
+	/*if !confirmBottomFormation(history) {
+		t.wallet.Release(t.investmentPerTrade)
+		fmt.Printf("[SKIP] [%s] No bottom pattern detected\n", t.Symbol)
+		return false
+	}*/
+
+	// Bollinger Bands: cumpără doar în zona inferioară
+	if t.se.UseBollinger {
+		lower, _, _ := strategy.CalculateBollingerBands(history, t.se.BollingerWindow)
+		if price > lower*1.02 {
+			t.wallet.Release(t.investmentPerTrade)
+			fmt.Printf("[SKIP] [%s] Price not low enough in Bollinger band (%.2f > %.2f)\n", t.Symbol, price, lower*1.02)
+			return false
+		}
+	}
+
+	// RSI: trebuie să fie destul de jos
+	rsi := t.se.CalculateRSI(history)
+	if rsi > 40 {
+		t.wallet.Release(t.investmentPerTrade)
+		fmt.Printf("[SKIP] [%s] RSI too high for buy: %.2f\n", t.Symbol, rsi)
+		return false
+	}
+
+	// Spread verificare
+	spread := t.binClient.GetSpread(t.Symbol)
+	if spread > 0.002 {
+		t.wallet.Release(t.investmentPerTrade)
+		fmt.Printf("[SKIP] [%s] Spread too high: %.4f\n", t.Symbol, spread)
+		return false
+	}
+
+	return true
+}
+
+func (t *Trader) tryBuy(price float64) {
+	amount, err := t.binClient.CalculateBuyQty(t.Symbol, t.investmentPerTrade)
+	if err != nil || amount <= 0 {
+		t.wallet.Release(t.investmentPerTrade)
+		//t.notifier.Send(fmt.Sprintf("[BUY ERROR] [%s] CalculateBuyQty failed: %v", t.Symbol, err))
+		return
+	}
+
+	executedPrice := price
+	if !t.demo {
+		executedPrice, err = t.binClient.MarketBuy(t.Symbol, amount)
+		if err != nil {
+			t.wallet.Release(t.investmentPerTrade)
+			t.notifier.Send(fmt.Sprintf("[ERROR] [%s] MarketBuy failed: %v", t.Symbol, err))
+			return
+		}
+	}
+
+	notional := amount * executedPrice
+	t.assetHeld += amount
+	t.usdcInvested += notional
+	t.averageBuyPrice = t.usdcInvested / t.assetHeld
+	t.trailingHigh = executedPrice
+	t.entries++
+	t.holding = true
+	if t.entries == 1 {
+		t.se.LastBuyTime = time.Now()
+	}
+	t.db.LogTransaction(t.Symbol, "BUY", amount, executedPrice)
+	fmt.Printf("[TRADE] [%s] Bought at %.2f (%.2f USDC)\n", t.Symbol, executedPrice, notional)
+}
+
+func (t *Trader) canSell(price float64, history []float64) bool {
+	if !t.holding || t.assetHeld <= 0 {
+		return false
+	}
+
+	balance, _ := t.binClient.GetAssetBalance(strings.Replace(t.Symbol, "USDC", "", 1))
+	if balance == 0 {
+		t.resetState()
+		return false
+	}
+
+	holdingTime := time.Since(t.se.LastBuyTime)
+	if holdingTime < t.minHoldDuration || holdingTime < t.minSellInterval {
+		return false
+	}
+
+	if price > t.trailingHigh {
+		t.trailingHigh = price
+	}
+
+	commission := t.se.CommissionRate
+	netProfit := ((price * (1 - commission)) - (t.averageBuyPrice * (1 + commission))) / t.averageBuyPrice
+
+	if netProfit < t.se.MinProfitMargin {
+		return false
+	}
+
+	spread := t.binClient.GetSpread(t.Symbol)
+	if spread > 0.002 {
+		fmt.Printf("[SKIP] [%s] Spread too high: %.4f\n", t.Symbol, spread)
+		return false
+	}
+
+	if price < t.trailingHigh*(1-t.dynamicTrailingStop(netProfit)) && t.confirmDownTrend(history) {
+		return true
+	}
+
+	return t.se.ShouldSell(price, t.averageBuyPrice, history)
+}
+
+func (t *Trader) trySell(price float64) {
+	step := t.binClient.GetSymbolFilter(t.Symbol).StepSize
+	sellAmount := roundQuantity(t.assetHeld, step)
+	if sellAmount <= 0 {
+		return
+	}
+
+	balance, _ := t.binClient.GetAssetBalance(strings.Replace(t.Symbol, "USDC", "", 1))
+	if balance < sellAmount {
+		fmt.Printf("[SKIP] [%s] Not enough balance to sell (have %.4f, need %.4f)", t.Symbol, balance, sellAmount)
+		t.resetState()
+		return
+	}
+
+	executedPrice := price
+	var err error
+	if !t.demo {
+		executedPrice, err = t.binClient.MarketSell(t.Symbol, sellAmount)
+		if err != nil {
+			t.notifier.Send(fmt.Sprintf("[ERROR] [%s] MarketSell failed: %v", t.Symbol, err))
+			return
+		}
+	}
+
+	usdcReturn := sellAmount * executedPrice
+	t.wallet.Release(usdcReturn)
+
+	commission := t.se.CommissionRate
+	netProfit := ((executedPrice * (1 - commission)) - (t.averageBuyPrice * (1 + commission))) / t.averageBuyPrice
+	holdingTime := time.Since(t.se.LastBuyTime)
+
+	t.assetHeld = 0
+	t.holding = false
+	t.usdcProfit += usdcReturn - t.usdcInvested
+	t.usdcInvested = 0
+	t.averageBuyPrice = 0
+	t.trailingHigh = 0
+	t.entries = 0
+	t.lastSellTime = time.Now()
+	t.lastSellPrice = executedPrice
+	t.lastSellProfit = netProfit * 100
+
+	t.db.LogTransaction(t.Symbol, "SELL", sellAmount, executedPrice)
+	fmt.Printf("[TRADE] [%s] Sold at %.2f | NetProfit: %.2f%% | Held: %.0fmin\n", t.Symbol, executedPrice, netProfit*100, holdingTime.Minutes())
+}
+
+func (t *Trader) updateBalances() {
+	if t.demo || t.dailyStartValue != 0 {
+		return
+	}
+
+	asset := strings.Replace(t.Symbol, "USDC", "", 1)
+	price := t.mw.GetPrice(t.Symbol)
+	balance, err := t.binClient.GetAssetBalance(asset)
+	if err != nil {
+		fmt.Printf("[WARN] [%s] Cannot fetch balance for %s: %v\n", t.Symbol, asset, err)
+		balance = 0
+	}
+
+	t.assetHeld = balance
+	if t.assetHeld > 0 {
+		if t.averageBuyPrice == 0 {
+			t.averageBuyPrice = price
+		}
+		if t.usdcInvested == 0 {
+			t.usdcInvested = t.assetHeld * t.averageBuyPrice
+		}
+		t.holding = true
+		fmt.Printf("[SYNC] [%s] Resumed holding %.4f units\n", t.Symbol, t.assetHeld)
+	}
+
+	t.dailyStartValue = t.assetHeld*price + t.wallet.Balance()
+	fmt.Printf("[INIT] [%s] Daily start set to %.2f (asset=%.2f, usdc=%.2f)\n",
+		t.Symbol, t.dailyStartValue, t.assetHeld*price, t.wallet.Balance())
+}
+
+func (t *Trader) resetIfInvalid(price float64) {
+	if t.holding && t.assetHeld > 0 && t.assetHeld < t.minHoldingThreshold {
+		if t.assetHeld*price < 5 {
+			fmt.Printf("[RESET] [%s] holding %.8f too low\n", t.Symbol, t.assetHeld)
+			t.resetState()
+		}
+	}
+}
+
+func (t *Trader) resetState() {
+	t.assetHeld = 0
+	t.holding = false
+	t.averageBuyPrice = 0
+	t.trailingHigh = 0
+	t.entries = 0
+	t.usdcInvested = 0
+}
+
+func (t *Trader) confirmDownTrend(history []float64) bool {
+	if len(history) < 3 {
+		return false
+	}
+	return history[len(history)-1] < history[len(history)-2] &&
+		history[len(history)-2] < history[len(history)-3]
+}
+
+func (t *Trader) dynamicTrailingStop(netProfit float64) float64 {
+	switch {
+	case netProfit >= 0.06:
+		return 0.012
+	case netProfit >= 0.03:
+		return 0.015
+	case netProfit >= 0.015:
+		return 0.02
+	case netProfit >= 0.01:
+		return 0.025
+	default:
+		return 0.035
+	}
+}
+
+func (t *Trader) Summary(price float64) map[string]float64 {
+	unrealized := t.assetHeld * price
+	return map[string]float64{
+		"assetHeld":         t.assetHeld,
+		"usdcInvested":      t.usdcInvested,
+		"usdcProfit":        t.usdcProfit,
+		"unrealized":        unrealized,
+		"totalValue":        t.totalValue(price),
+		"averageBuyPrice":   t.averageBuyPrice,
+		"usdcInvestedTotal": t.usdcProfit + unrealized,
+		"usdcBalance":       t.wallet.Balance(),
+	}
+}
+
 type StateSnapshot struct {
 	AssetHeld       float64
 	USDCInvested    float64
@@ -74,261 +396,65 @@ func (t *Trader) RestoreState(s StateSnapshot) {
 	t.lastSellTime = s.LastSellTime
 }
 
-// NewTrader initializes a new Trader instance.
-func NewTrader(
-	db *store.Store,
-	mw *market.MarketWatcher,
-	se *strategy.StrategyEngine,
-	demo bool,
-	usdcBalance float64,
-	investmentPerTrade float64,
-	binClient *binance.Client,
-	minHoldingThreshold float64,
-	minHoldDuration time.Duration,
-) *Trader {
-	return &Trader{
-		db:                  db,
-		mw:                  mw,
-		se:                  se,
-		binClient:           binClient,
-		demo:                demo,
-		usdcBalance:         usdcBalance,
-		dailyStartValue:     usdcBalance,
-		investmentPerTrade:  investmentPerTrade,
-		holding:             false,
-		trailingStopPct:     0.02,
-		maxEntries:          3,
-		cooldownDuration:    60 * time.Second,
-		minHoldingThreshold: minHoldingThreshold,
-		minHoldDuration:     minHoldDuration,
-	}
+func roundQuantity(quantity float64, step float64) float64 {
+	return math.Floor(quantity/step) * step
 }
 
-// Run continuously evaluates market conditions and executes buy/sell logic.
-func (t *Trader) Run() {
-	for {
-		time.Sleep(5 * time.Second)
-		price := t.mw.GetPrice(t.Symbol)
-		history := t.mw.GetHistory(t.Symbol)
-		value := t.totalValue(price)
-
-		t.updateBalances()
-		t.checkSafety(value)
-		t.resetIfInvalid(price)
-
-		if t.inCooldown() {
-			continue
-		}
-
-		if t.canBuy(price, history) {
-			t.tryBuy(price)
-		} else if t.canSell(price, history) {
-			t.trySell(price)
-		}
-	}
+func (t *Trader) totalValue(price float64) float64 {
+	return t.wallet.Balance() + t.assetHeld*price
 }
 
-// updateBalances updates real USDC and asset balances if not in demo mode.
-func (t *Trader) updateBalances() {
-	if !t.demo {
-		if realUSDC, err := t.binClient.GetUSDCBalance(); err == nil {
-			t.usdcBalance = realUSDC
-		}
-		asset := strings.Replace(t.Symbol, "USDC", "", 1)
-		if realAsset, err := t.binClient.GetAssetBalance(asset); err == nil {
-			t.assetHeld = realAsset
-		}
-	}
-}
+func (t *Trader) ForceSell() {
+	price := t.mw.GetPrice(t.Symbol)
+	step := t.binClient.GetSymbolFilter(t.Symbol).StepSize
+	sellAmount := roundQuantity(t.assetHeld, step)
 
-// checkSafety logs a warning if total value drops significantly.
-func (t *Trader) checkSafety(value float64) {
-	if value < t.dailyStartValue*0.75 {
-		fmt.Printf("[WARNING] [%s] Total value %.2f dropped below 75%% of initial %.2f\n", t.Symbol, value, t.dailyStartValue)
-	}
-}
-
-// resetIfInvalid resets state if asset held is too small to be valid.
-func (t *Trader) resetIfInvalid(price float64) {
-	if t.holding && t.assetHeld > 0 && t.assetHeld < t.minHoldingThreshold {
-		notional := t.assetHeld * price
-		if notional >= 5 {
-			fmt.Printf("[INFO] [%s] Low holding (%.8f), but value %.2f is acceptable\n", t.Symbol, t.assetHeld, notional)
-			return
-		}
-		fmt.Printf("[RESET] [%s] Holding too low (%.8f, %.2f USD), resetting\n", t.Symbol, t.assetHeld, notional)
-		t.resetState()
-	}
-}
-
-// inCooldown checks whether the trader is still in cooldown after a sale.
-func (t *Trader) inCooldown() bool {
-	if time.Since(t.lastSellTime) < t.cooldownDuration {
-		fmt.Printf("[COOLDOWN] [%s] %.0fs remaining\n", t.Symbol, (t.cooldownDuration - time.Since(t.lastSellTime)).Seconds())
-		return true
-	}
-	return false
-}
-
-// canBuy determines if conditions are met to place a buy order.
-func (t *Trader) canBuy(price float64, history []float64) bool {
-	buyPrice := t.averageBuyPrice
-	return (!t.holding || (t.entries < t.maxEntries && price < buyPrice*0.96)) &&
-		t.se.ShouldBuy(price, history, t.lastSellPrice)
-}
-
-// tryBuy executes a market buy if conditions are met.
-func (t *Trader) tryBuy(price float64) {
-	if t.usdcBalance < t.investmentPerTrade {
-		fmt.Printf("[SKIP] [%s] Not enough USDC (%.2f < %.2f)\n", t.Symbol, t.usdcBalance, t.investmentPerTrade)
-		return
-	}
-	amount, err := t.binClient.CalculateBuyQty(t.Symbol, t.investmentPerTrade)
-	if err != nil || amount <= 0 {
-		fmt.Printf("[SKIP] [%s] Cannot buy: %v\n", t.Symbol, err)
-		return
-	}
-	notional := amount * price
-	if !t.demo {
-		if err := t.binClient.MarketBuy(t.Symbol, amount); err != nil {
-			fmt.Printf("[ERROR] [%s] Market Buy failed: %v\n", t.Symbol, err)
-			return
-		}
-	}
-	t.assetHeld += amount
-	t.usdcBalance -= notional
-	t.usdcInvested += notional
-	t.averageBuyPrice = t.usdcInvested / t.assetHeld
-	t.trailingHigh = price
-	t.entries++
-	t.holding = true
-
-	if t.entries == 1 {
-		t.se.LastBuyTime = time.Now()
-	}
-	if t.assetHeld < t.minHoldingThreshold {
-		t.minHoldingThreshold = t.assetHeld * 0.9
-		fmt.Printf("[ADJUST] [%s] Lowered minHoldingThreshold to %.8f\n", t.Symbol, t.minHoldingThreshold)
-	}
-	t.db.LogTransaction(t.Symbol, "BUY", amount, price)
-	fmt.Printf("[TRADE] [%s] Bought at %.2f (%.2f USDC)\n", t.Symbol, price, notional)
-}
-
-// canSell determines if conditions are met to place a sell order.
-func (t *Trader) canSell(price float64, history []float64) bool {
-	if !t.holding || t.assetHeld <= 0 {
-		return false
-	}
-	value := t.assetHeld * price
-	if value < 5 {
-		fmt.Printf("[SKIP] [%s] Position value %.2f below threshold\n", t.Symbol, value)
-		return false
-	}
-
-	buyPrice := t.averageBuyPrice
-	holdingTime := time.Since(t.se.LastBuyTime)
-	if holdingTime < t.minHoldDuration {
-		fmt.Printf("[SKIP] [%s] Holding %.0fs < minHold %.0fs\n", t.Symbol, holdingTime.Seconds(), t.minHoldDuration.Seconds())
-		return false
-	}
-
-	if price > t.trailingHigh {
-		t.trailingHigh = price
-	}
-	trailingStop := t.trailingHigh * (1 - t.trailingStopPct)
-
-	commission := t.se.CommissionRate
-	grossProfit := (price - buyPrice) / buyPrice
-	netProfit := ((price * (1 - commission)) - (buyPrice * (1 + commission))) / buyPrice
-
-	fmt.Printf("[CHECK] [%s] Gross=%.4f%%, Net=%.4f%%, RSI=%.2f, Price=%.2f, High=%.2f, Stop=%.2f\n",
-		t.Symbol, grossProfit*100, netProfit*100, t.se.LastRSI, price, t.trailingHigh, trailingStop)
-
-	if netProfit < t.se.MinProfitMargin {
-		fmt.Printf("[SKIP] [%s] Net profit %.4f%% below target %.4f%%\n", t.Symbol, netProfit*100, t.se.MinProfitMargin*100)
-		return false
-	}
-
-	if t.se.LastRSI > 85 && grossProfit > 0.001 {
-		fmt.Printf("[TRIGGER] [%s] RSI>85 and profit>0.1%%\n", t.Symbol)
-		return true
-	}
-
-	return price < trailingStop || t.se.ShouldSell(price, buyPrice, history)
-}
-
-// trySell executes a market sell if conditions are met.
-func (t *Trader) trySell(price float64) {
-	sellAmount := roundQuantity(t.assetHeld, 0.000001)
 	if sellAmount <= 0 {
-		fmt.Printf("[SKIP] [%s] Sell amount too small\n", t.Symbol)
+		fmt.Printf("[FORCESELL] [%s] Nothing to sell\n", t.Symbol)
 		return
 	}
 
-	usdcReturn := sellAmount * price
-	buyPrice := t.averageBuyPrice
-	commission := t.se.CommissionRate
-
-	grossProfit := (price - buyPrice) / buyPrice
-	netProfit := ((price * (1 - commission)) - (buyPrice * (1 + commission))) / buyPrice
-	holdingTime := time.Since(t.se.LastBuyTime)
-
+	executedPrice := price
+	var err error
 	if !t.demo {
-		if err := t.binClient.MarketSell(t.Symbol, sellAmount); err != nil {
-			fmt.Printf("[ERROR] [%s] Market Sell failed: %v\n", t.Symbol, err)
+		executedPrice, err = t.binClient.MarketSell(t.Symbol, sellAmount)
+		if err != nil {
+			msg := fmt.Sprintf("[FORCESELL ERROR] [%s] MarketSell failed: %v", t.Symbol, err)
+			fmt.Println(msg)
+			t.notifier.Send(msg)
 			return
 		}
 	}
+
+	usdcReturn := sellAmount * executedPrice
+	t.wallet.Release(usdcReturn)
+
+	t.db.LogTransaction(t.Symbol, "SELL", sellAmount, executedPrice)
+
 	t.assetHeld = 0
 	t.holding = false
-	t.usdcBalance += usdcReturn
 	t.usdcProfit += usdcReturn - t.usdcInvested
 	t.usdcInvested = 0
 	t.averageBuyPrice = 0
 	t.trailingHigh = 0
 	t.entries = 0
 	t.lastSellTime = time.Now()
-	t.lastSellPrice = price
+	t.lastSellPrice = executedPrice
+	t.lastSellProfit = 0
 
-	t.db.LogTransaction(t.Symbol, "SELL", sellAmount, price)
-
-	fmt.Printf("[TRADE] [%s] Sold at %.2f | Amount: %.6f | USDC: %.2f\n", t.Symbol, price, sellAmount, usdcReturn)
-	fmt.Printf(" - Gross profit: %.4f%% | Net: %.4f%% | Held: %.0f minutes\n",
-		grossProfit*100, netProfit*100, holdingTime.Minutes())
+	fmt.Printf("[FORCESELL] [%s] Sold %.4f at %.2f (%.2f USDC)\n", t.Symbol, sellAmount, executedPrice, usdcReturn)
 }
 
-// resetState clears the trader state when invalid or after selling.
-func (t *Trader) resetState() {
-	t.assetHeld = 0
-	t.holding = false
-	t.averageBuyPrice = 0
-	t.trailingHigh = 0
-	t.entries = 0
-	t.usdcInvested = 0
+func (t *Trader) SetInvestmentPerTrade(newAmount float64) {
+	t.investmentPerTrade = newAmount
 }
 
-// totalValue returns the current portfolio value (USDC + asset).
-func (t *Trader) totalValue(price float64) float64 {
-	return t.usdcBalance + t.assetHeld*price
-}
-
-// roundQuantity ensures buy/sell amounts are rounded properly.
-func roundQuantity(quantity float64, step float64) float64 {
-	return math.Floor(quantity/step) * step
-}
-
-// Summary returns the current trading summary.
-func (t *Trader) Summary(price float64) map[string]float64 {
-	unrealized := t.assetHeld * price
-	return map[string]float64{
-		"assetHeld":         t.assetHeld,
-		"usdcInvested":      t.usdcInvested,
-		"usdcProfit":        t.usdcProfit,
-		"usdcBalance":       t.usdcBalance,
-		"unrealized":        unrealized,
-		"totalValue":        t.totalValue(price),
-		"averageBuyPrice":   t.averageBuyPrice,
-		"investedNow":       unrealized,
-		"usdcInvestedTotal": t.usdcProfit + unrealized,
+func confirmBottomFormation(history []float64) bool {
+	if len(history) < 5 {
+		return false
 	}
+	n := len(history)
+	return history[n-3] < history[n-4] &&
+		history[n-2] > history[n-3] &&
+		history[n-1] > history[n-2]
 }

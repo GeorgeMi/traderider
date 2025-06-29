@@ -90,6 +90,15 @@
             color: #ff6b6b;
             margin: 1rem 0;
         }
+        .force-sell {
+            background: #f44336;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            padding: 5px 10px;
+            cursor: pointer;
+            margin-left: 10px;
+        }
     </style>
 </head>
 <body>
@@ -98,6 +107,7 @@
     <div class="controls">
         <select id="symbol"></select>
         <button id="switchBtn" onclick="switchMode()">Transactions</button>
+        <button id="performanceBtn" onclick="showPerformance()">Performance</button>
     </div>
 </div>
 
@@ -121,25 +131,55 @@
 
 <div id="smart-view" class="hidden"></div>
 
+<div id="performance-view" class="hidden">
+    <div style="padding: 1rem;">
+        <h2 style="color:#00eaff;margin-top:1rem;">Performance Metrics</h2>
+        <table>
+            <thead><tr><th>Symbol</th><th>Total Profit</th><th>Win Rate</th><th>Avg Profit</th><th>Avg Loss</th></tr></thead>
+            <tbody id="performance-table-body"></tbody>
+        </table>
+    </div>
+</div>
+
 <script>
     let chart;
-    let currentMode = 'classic';
-    const symbols = ['BTCUSDC', 'XRPUSDC', 'SOLUSDC', 'LINKUSDC'];
+    let mode = 'classic';
+    const symbols = ['BTCUSDC', 'XRPUSDC', 'SOLUSDC', 'LINKUSDC', 'SUIUSDC'];
     const symbolSelect = document.getElementById('symbol');
 
     function switchMode() {
-        currentMode = currentMode === 'classic' ? 'smart' : 'classic';
-        document.getElementById('classic-view').classList.toggle('hidden', currentMode !== 'classic');
-        document.getElementById('smart-view').classList.toggle('hidden', currentMode !== 'smart');
-        document.getElementById('switchBtn').textContent = currentMode === 'classic' ? 'Transactions' : 'Dashboard';
+        mode = mode === 'classic' ? 'smart' : 'classic';
+        document.getElementById('classic-view').classList.toggle('hidden', mode !== 'classic');
+        document.getElementById('smart-view').classList.toggle('hidden', mode !== 'smart');
+        document.getElementById('performance-view').classList.add('hidden');
+        document.getElementById('switchBtn').textContent = mode === 'classic' ? 'Transactions' : 'Dashboard';
+        symbolSelect.style.display = '';
         updateSymbolOptions();
-        if (currentMode === 'classic') loadClassic(symbolSelect.value);
+        if (mode === 'classic') loadClassic(symbolSelect.value);
         else loadSmart();
+    }
+
+    function showPerformance() {
+        mode = 'performance';
+        document.getElementById('classic-view').classList.add('hidden');
+        document.getElementById('smart-view').classList.add('hidden');
+        document.getElementById('performance-view').classList.remove('hidden');
+        document.getElementById('switchBtn').textContent = 'Dashboard';
+        symbolSelect.style.display = 'none';
+        fetch('/api/performance').then(res => res.json()).then(data => {
+            const tbody = document.getElementById('performance-table-body');
+            tbody.innerHTML = '';
+            Object.entries(data).forEach(([symbol, stats]) => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td>${symbol}</td><td>${stats.totalProfit.toFixed(2)}</td><td>${(stats.winRate * 100).toFixed(1)}%</td><td>${stats.avgProfit.toFixed(2)}</td><td>${stats.avgLoss.toFixed(2)}</td>`;
+                tbody.appendChild(tr);
+            });
+        });
     }
 
     function updateSymbolOptions() {
         symbolSelect.innerHTML = '';
-        if (currentMode === 'smart') {
+        if (mode === 'smart') {
             const allOption = document.createElement('option');
             allOption.value = 'ALL';
             allOption.textContent = 'All';
@@ -153,13 +193,22 @@
         });
     }
 
+    symbolSelect.addEventListener('change', () => {
+        if (mode === 'classic') {
+            chart?.destroy();
+            chart = null;
+            loadClassic(symbolSelect.value);
+        } else if (mode === 'smart') {
+            loadSmart();
+        }
+    });
+
     function loadClassic(symbol) {
         fetch(`/api/summary/${symbol}`).then(res => res.json()).then(summary => {
             document.getElementById('assetHeld').textContent = summary.assetHeld?.toFixed(4);
             document.getElementById('investedNow').textContent = summary.investedNow?.toFixed(2);
             document.getElementById('usdcProfit').textContent = summary.usdcProfit?.toFixed(2);
             document.getElementById('unrealized').textContent = summary.unrealized?.toFixed(2);
-            document.getElementById('totalValue').textContent = summary.totalValue?.toFixed(2);
             document.getElementById('usdcBalance').textContent = summary.usdcBalance?.toFixed(2);
             document.getElementById('usdcInvested').textContent = summary.usdcInvested?.toFixed(2);
         });
@@ -168,7 +217,7 @@
             const tbody = document.getElementById('txs');
             tbody.innerHTML = '';
             data.forEach(tx => {
-                const time = new Date(tx.time).toLocaleString('ro-RO', { timeZone: 'Europe/Bucharest' });
+                const time = new Date(tx.time).toLocaleString('en-GB');
                 const row = `<tr><td>${tx.symbol}</td><td>${tx.side}</td><td>${tx.amount.toFixed(4)}</td><td>${tx.price.toFixed(2)}</td><td>${time}</td></tr>`;
                 tbody.innerHTML += row;
             });
@@ -191,33 +240,37 @@
                 { label: 'Current Price', data: currentLine, borderColor: 'gray', borderDash: [4, 4], fill: false, pointRadius: 0, borderWidth: 1 }
             ];
 
-            const options = {
-                responsive: true,
-                animation: false,
-                interaction: { mode: 'nearest', intersect: false },
-                plugins: {
-                    tooltip: {
-                        callbacks: {
-                            label: function (context) {
-                                const point = context.raw;
-                                return point?.amount !== undefined ? `${context.dataset.label}: ${point.y.toFixed(2)} USD, ${point.amount.toFixed(6)} units` : `${context.dataset.label}: ${point.y.toFixed(2)} USD`;
-                            }
-                        }
-                    }
-                },
-                scales: {
-                    x: {
-                        type: 'time',
-                        time: { tooltipFormat: 'HH:mm:ss', displayFormats: { second: 'HH:mm:ss', minute: 'HH:mm' } },
-                        ticks: { color: '#aaa', autoSkip: true, maxTicksLimit: 20 }
-                    },
-                    y: { ticks: { color: '#aaa' } }
-                }
-            };
-
             if (!chart) {
                 const ctx = document.getElementById('priceChart').getContext('2d');
-                chart = new Chart(ctx, { type: 'line', data: { labels: priceData.map(p => p.x), datasets }, options });
+                chart = new Chart(ctx, {
+                    type: 'line',
+                    data: { labels: priceData.map(p => p.x), datasets },
+                    options: {
+                        responsive: true,
+                        animation: false,
+                        interaction: { mode: 'index', intersect: false },
+                        plugins: {
+                            tooltip: {
+                                callbacks: {
+                                    label: function (context) {
+                                        const point = context.raw;
+                                        return point?.amount !== undefined
+                                            ? `${context.dataset.label}: ${point.y.toFixed(2)} USD, ${point.amount.toFixed(6)} units`
+                                            : `${context.dataset.label}: ${point.y.toFixed(2)} USD`;
+                                    }
+                                }
+                            }
+                        },
+                        scales: {
+                            x: {
+                                type: 'time',
+                                time: { tooltipFormat: 'HH:mm:ss', displayFormats: { second: 'HH:mm:ss', minute: 'HH:mm' } },
+                                ticks: { color: '#aaa', autoSkip: true, maxTicksLimit: 20 }
+                            },
+                            y: { ticks: { color: '#aaa' } }
+                        }
+                    }
+                });
             } else {
                 chart.data.labels = priceData.map(p => p.x);
                 chart.data.datasets.forEach((ds, i) => { ds.data = datasets[i].data });
@@ -226,42 +279,53 @@
 
             document.getElementById("chartStatus").style.display = prices.length === 0 ? "block" : "none";
         });
+
+        fetch("/api/wallet").then(res => res.json()).then(data => {
+            document.getElementById("totalValue").textContent = data.totalWalletValue.toFixed(2);
+        });
     }
 
     function loadSmart() {
         const container = document.getElementById('smart-view');
-        container.innerHTML = '';
-
         const selected = symbolSelect.value;
         const toLoad = selected === 'ALL' ? symbols.slice() : [selected];
 
         const promises = toLoad.map(symbol =>
-            fetch(`/api/transactions/${symbol}`)
-                .then(res => res.json())
-                .then(data => ({
-                    symbol,
-                    data,
-                    price: data.length > 0 ? data[0].price : Infinity
-                }))
+            Promise.all([
+                fetch(`/api/transactions/${symbol}`).then(res => res.json()),
+                fetch(`/api/chart-data/${symbol}`).then(res => res.json())
+            ]).then(([txs, chart]) => ({
+                symbol,
+                data: txs,
+                price: chart.currentPrice
+            }))
         );
 
         Promise.all(promises).then(results => {
-            // Sortează simbolurile după preț crescător
             results.sort((a, b) => a.price - b.price);
 
-            results.forEach(({ symbol, data }) => {
-                const section = document.createElement('div');
-                section.innerHTML = `
-                <h2>${symbol}</h2>
-                <table>
-                    <thead><tr><th>Side</th><th>Amount</th><th>Price</th><th>Time</th></tr></thead>
-                    <tbody id="txs-${symbol}"></tbody>
-                </table>`;
-                container.appendChild(section);
+            results.forEach(({ symbol, data, price }) => {
+                let section = document.getElementById(`section-${symbol}`);
+                if (!section) {
+                    section = document.createElement('div');
+                    section.id = `section-${symbol}`;
+                    section.innerHTML = `
+              <h2 id="title-${symbol}">${symbol} <span style="color: #00eaff; font-size: 0.9em;">(${price.toFixed(2)} USDC)</span>
+              <button class="force-sell" onclick="forceSell('${symbol}')">Force Sell</button></h2>
+              <table>
+                <thead><tr><th>Side</th><th>Amount</th><th>Price</th><th>Time</th></tr></thead>
+                <tbody id="txs-${symbol}"></tbody>
+              </table>`;
+                    container.appendChild(section);
+                } else {
+                    const title = document.getElementById(`title-${symbol}`);
+                    title.querySelector('span').textContent = `(${price.toFixed(2)} USDC)`;
+                }
 
                 const tbody = document.getElementById(`txs-${symbol}`);
-                data.forEach(tx => {
-                    const time = new Date(tx.time).toLocaleString('ro-RO', { timeZone: 'Europe/Bucharest' });
+                tbody.innerHTML = '';
+                data.slice(0, 10).forEach(tx => {
+                    const time = new Date(tx.time).toLocaleString('en-GB');
                     const row = document.createElement('tr');
                     row.innerHTML = `<td>${tx.side}</td><td>${tx.amount.toFixed(4)}</td><td>${tx.price.toFixed(2)}</td><td>${time}</td>`;
                     tbody.appendChild(row);
@@ -270,8 +334,25 @@
         });
     }
 
+    function updateSmartPrices() {
+        if (mode !== 'smart') return;
+        symbols.forEach(symbol => {
+            fetch(`/api/chart-data/${symbol}`).then(res => res.json()).then(data => {
+                const price = data.currentPrice;
+                const titleEl = document.getElementById(`title-${symbol}`);
+                if (titleEl) {
+                    titleEl.querySelector('span').textContent = `(${price.toFixed(2)} USDC)`;
+                }
+            });
+        });
+    }
+
+    function forceSell(symbol) {
+        fetch(`/api/force-sell/${symbol}`, { method: 'POST' }).then(() => loadSmart());
+    }
+
     symbolSelect.addEventListener('change', () => {
-        if (currentMode === 'classic') {
+        if (mode === 'classic') {
             chart?.destroy();
             chart = null;
             loadClassic(symbolSelect.value);
@@ -283,7 +364,7 @@
     updateSymbolOptions();
     loadClassic(symbols[0]);
     setInterval(() => {
-        if (currentMode === 'smart') loadSmart();
+        if (mode === 'smart') updateSmartPrices();
         else loadClassic(symbolSelect.value);
     }, 10000);
 </script>

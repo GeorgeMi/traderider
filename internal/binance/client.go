@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"strconv"
+	"traderider/internal/notifier"
 
 	binance "github.com/adshao/go-binance/v2"
 )
@@ -13,6 +14,7 @@ import (
 type Client struct {
 	api           *binance.Client
 	symbolFilters map[string]SymbolFilter
+	notifier      *notifier.WhatsAppNotifier
 }
 
 type SymbolFilter struct {
@@ -21,11 +23,12 @@ type SymbolFilter struct {
 	MinNotional float64
 }
 
-func NewClient(apiKey, secretKey string) *Client {
+func NewClient(apiKey, secretKey string, notifier *notifier.WhatsAppNotifier) *Client {
 	c := binance.NewClient(apiKey, secretKey)
 	client := &Client{
 		api:           c,
 		symbolFilters: make(map[string]SymbolFilter),
+		notifier:      notifier,
 	}
 	client.loadSymbolFilters()
 	return client
@@ -35,6 +38,7 @@ func (c *Client) loadSymbolFilters() {
 	info, err := c.api.NewExchangeInfoService().Do(context.Background())
 	if err != nil {
 		log.Printf("[ERROR] Failed to load exchange info: %v", err)
+		c.notifier.Send(fmt.Sprintf("[ERROR] Failed to load exchange info: %v", err))
 		return
 	}
 	for _, sym := range info.Symbols {
@@ -42,23 +46,13 @@ func (c *Client) loadSymbolFilters() {
 		for _, filter := range sym.Filters {
 			switch filter["filterType"] {
 			case "LOT_SIZE":
-				if minQtyStr, ok := filter["minQty"].(string); ok {
-					minQty, _ = strconv.ParseFloat(minQtyStr, 64)
-				}
-				if stepSizeStr, ok := filter["stepSize"].(string); ok {
-					stepSize, _ = strconv.ParseFloat(stepSizeStr, 64)
-				}
+				minQty, _ = strconv.ParseFloat(filter["minQty"].(string), 64)
+				stepSize, _ = strconv.ParseFloat(filter["stepSize"].(string), 64)
 			case "NOTIONAL":
-				if notionalStr, ok := filter["minNotional"].(string); ok {
-					minNotional, _ = strconv.ParseFloat(notionalStr, 64)
-				}
+				minNotional, _ = strconv.ParseFloat(filter["minNotional"].(string), 64)
 			}
 		}
-		c.symbolFilters[sym.Symbol] = SymbolFilter{
-			MinQty:      minQty,
-			StepSize:    stepSize,
-			MinNotional: minNotional,
-		}
+		c.symbolFilters[sym.Symbol] = SymbolFilter{MinQty: minQty, StepSize: stepSize, MinNotional: minNotional}
 	}
 }
 
@@ -66,16 +60,29 @@ func (c *Client) GetSymbolPrice(symbol string) float64 {
 	res, err := c.api.NewListPricesService().Symbol(symbol).Do(context.Background())
 	if err != nil || len(res) == 0 {
 		log.Printf("[ERROR] Binance price error for %s: %v", symbol, err)
+		c.notifier.Send(fmt.Sprintf("[ERROR] Binance price error for %s: %v", symbol, err))
 		return 0
 	}
 	price, _ := strconv.ParseFloat(res[0].Price, 64)
 	return price
 }
 
+func (c *Client) GetSpread(symbol string) float64 {
+	orderBook, err := c.api.NewDepthService().Symbol(symbol).Limit(5).Do(context.Background())
+	if err != nil || len(orderBook.Bids) == 0 || len(orderBook.Asks) == 0 {
+		log.Printf("[ERROR] Failed to fetch order book: %v", err)
+		return 9999
+	}
+	bid, _ := strconv.ParseFloat(orderBook.Bids[0].Price, 64)
+	ask, _ := strconv.ParseFloat(orderBook.Asks[0].Price, 64)
+	return (ask - bid) / bid
+}
+
 func (c *Client) GetAssetBalance(asset string) (float64, error) {
 	account, err := c.api.NewGetAccountService().Do(context.Background())
 	if err != nil {
 		log.Printf("[ERROR] Binance account error: %v", err)
+		c.notifier.Send(fmt.Sprintf("[ERROR] Binance account error: %v", err))
 		return 0, err
 	}
 	for _, b := range account.Balances {
@@ -91,66 +98,63 @@ func (c *Client) GetUSDCBalance() (float64, error) {
 }
 
 func (c *Client) adjustQuantity(symbol string, quantity float64) float64 {
-	filter, ok := c.symbolFilters[symbol]
-	if !ok || filter.StepSize == 0 {
+	filter := c.GetSymbolFilter(symbol)
+	if filter.StepSize == 0 {
 		return quantity
 	}
-	rawSteps := quantity / filter.StepSize
-	if rawSteps < 1 {
-		return 0
+	steps := math.Floor(quantity / filter.StepSize)
+	adj := steps * filter.StepSize
+	if adj < filter.MinQty {
+		log.Printf("[ADJUST] Quantity %.8f < MinQty %.8f", adj, filter.MinQty)
 	}
-	adjusted := math.Floor(rawSteps) * filter.StepSize
-	if adjusted < filter.MinQty {
-		log.Printf("[ADJUST] Quantity %.8f is below MinQty %.8f, proceeding anyway", adjusted, filter.MinQty)
-	}
-	return adjusted
+	return adj
 }
 
 func (c *Client) GetSymbolFilter(symbol string) SymbolFilter {
 	if filter, ok := c.symbolFilters[symbol]; ok {
 		return filter
 	}
-	return SymbolFilter{
-		MinQty:      0.00001000,
-		StepSize:    0.00000001,
-		MinNotional: 10.0,
-	}
+	return SymbolFilter{MinQty: 0.00001, StepSize: 0.00000001, MinNotional: 10.0}
 }
 
-func (c *Client) MarketBuy(symbol string, quantity float64) error {
+func (c *Client) MarketBuy(symbol string, quantity float64) (float64, error) {
 	quantity = c.adjustQuantity(symbol, quantity)
 	if quantity <= 0 {
-		return fmt.Errorf("quantity after adjustment is 0 or below minQty for symbol %s", symbol)
+		return 0, fmt.Errorf("invalid quantity for MarketBuy: %s", symbol)
 	}
-	order, err := c.api.NewCreateOrderService().
-		Symbol(symbol).
-		Side(binance.SideTypeBuy).
-		Type(binance.OrderTypeMarket).
-		Quantity(fmt.Sprintf("%.8f", quantity)).
-		Do(context.Background())
+	order, err := c.api.NewCreateOrderService().Symbol(symbol).Side(binance.SideTypeBuy).
+		Type(binance.OrderTypeMarket).Quantity(fmt.Sprintf("%.8f", quantity)).Do(context.Background())
 	if err != nil {
-		return err
+		return 0, err
 	}
-	log.Printf("Market Buy Order executed: %+v", order)
-	return nil
+	return parseFillPrice(order.Fills)
 }
 
-func (c *Client) MarketSell(symbol string, quantity float64) error {
+func (c *Client) MarketSell(symbol string, quantity float64) (float64, error) {
 	quantity = c.adjustQuantity(symbol, quantity)
 	if quantity <= 0 {
-		return fmt.Errorf("quantity after adjustment is 0 or below minQty for symbol %s", symbol)
+		return 0, fmt.Errorf("invalid quantity for MarketSell: %s", symbol)
 	}
-	order, err := c.api.NewCreateOrderService().
-		Symbol(symbol).
-		Side(binance.SideTypeSell).
-		Type(binance.OrderTypeMarket).
-		Quantity(fmt.Sprintf("%.8f", quantity)).
-		Do(context.Background())
+	order, err := c.api.NewCreateOrderService().Symbol(symbol).Side(binance.SideTypeSell).
+		Type(binance.OrderTypeMarket).Quantity(fmt.Sprintf("%.8f", quantity)).Do(context.Background())
 	if err != nil {
-		return err
+		return 0, err
 	}
-	log.Printf("Market Sell Order executed: %+v", order)
-	return nil
+	return parseFillPrice(order.Fills)
+}
+
+func parseFillPrice(fills []*binance.Fill) (float64, error) {
+	totalPrice, totalQty := 0.0, 0.0
+	for _, f := range fills {
+		price, _ := strconv.ParseFloat(f.Price, 64)
+		qty, _ := strconv.ParseFloat(f.Quantity, 64)
+		totalPrice += price * qty
+		totalQty += qty
+	}
+	if totalQty == 0 {
+		return 0, fmt.Errorf("empty fills")
+	}
+	return totalPrice / totalQty, nil
 }
 
 func (c *Client) CalculateBuyQty(symbol string, availableUSDC float64) (float64, error) {
@@ -161,17 +165,13 @@ func (c *Client) CalculateBuyQty(symbol string, availableUSDC float64) (float64,
 	filter := c.GetSymbolFilter(symbol)
 	minQty := filter.MinNotional / price
 	minQty = c.adjustQuantity(symbol, minQty)
-	requiredUSDC := minQty * price
-	if availableUSDC < requiredUSDC {
-		log.Printf("[BUY_QTY] Not enough USDC: have %.2f, need %.2f for minQty %.8f", availableUSDC, requiredUSDC, minQty)
-		return 0, fmt.Errorf("not enough USDC: need %.2f for minQty", requiredUSDC)
+	if availableUSDC < minQty*price {
+		return 0, fmt.Errorf("not enough USDC")
 	}
 	qty := availableUSDC / price
 	qty = c.adjustQuantity(symbol, qty)
-	notional := price * qty
-	if notional < filter.MinNotional {
-		log.Printf("[BUY_QTY] Notional too low: %.2f < %.2f", notional, filter.MinNotional)
-		return 0, fmt.Errorf("notional %.2f below minimum %.2f", notional, filter.MinNotional)
+	if qty*price < filter.MinNotional {
+		return 0, fmt.Errorf("notional too low")
 	}
 	return qty, nil
 }

@@ -6,6 +6,18 @@ import (
 	"time"
 )
 
+type FeatureVector struct {
+	Price       float64
+	EMAShort    float64
+	EMALong     float64
+	RSI         float64
+	BandLower   float64
+	BandUpper   float64
+	BandWidth   float64
+	LastSellGap float64
+	TimeOK      bool
+}
+
 type StrategyEngine struct {
 	ShortWindow        int
 	LongWindow         int
@@ -45,52 +57,32 @@ func (s *StrategyEngine) ShouldBuy(price float64, history []float64, lastSellPri
 		return false
 	}
 
-	emaShort := s.CalculateEMAShort(history)
-	emaLong := s.CalculateEMALong(history)
-	rsi := s.CalculateRSI(history)
-
-	s.LastEMAShort = emaShort
-	s.LastEMALong = emaLong
-	s.LastRSI = rsi
-
-	trendUp := emaShort > emaLong
-	priceAboveEMA := price > emaShort
-	rsiMomentum := rsi > 55
-	minGapOK := lastSellPrice == 0 || price > lastSellPrice*(1+s.MinTradeGapPercent)
-	timeOK := time.Since(s.LastSellTime) > 3*time.Minute || s.LastSellProfit >= 0.5
-
-	bollLower, _, bollUpper := 0.0, 0.0, 0.0
-	priceNearLowerBand := true
-	if s.UseBollinger {
-		bollLower, _, bollUpper = calculateBollingerBands(history, s.BollingerWindow)
-		priceNearLowerBand = price < bollLower*1.02
-		fmt.Printf("[BOLL] price=%.2f, lower=%.2f, upper=%.2f\n", price, bollLower, bollUpper)
+	// Așteaptă o scădere reală după vânzare
+	if lastSellPrice > 0 && price > lastSellPrice*(1-0.005) {
+		fmt.Printf("[STRATEGY] Waiting for price to drop further after last SELL (%.2f > %.2f)\n", price, lastSellPrice*(1-0.005))
+		return false
 	}
 
-	score := 0
-	if trendUp {
-		score++
-	}
-	if priceAboveEMA {
-		score++
-	}
-	if rsiMomentum {
-		score++
-	}
-	if minGapOK {
-		score++
-	}
-	if timeOK {
-		score++
-	}
-	if priceNearLowerBand {
-		score++
+	// Confirmă bottom local (minim + două creșteri)
+	if !confirmBottomFormation(history) {
+		fmt.Printf("[STRATEGY] No local bottom pattern detected\n")
+		return false
 	}
 
-	fmt.Printf("[STRATEGY] BUY check: price=%.2f, emaShort=%.2f, emaLong=%.2f, rsi=%.2f, score=%d/6\n",
-		price, emaShort, emaLong, rsi, score)
+	features := s.extractFeatures(price, history, lastSellPrice)
+	score := s.buyScore(features)
 
-	return score >= 5
+	return score > 1.8
+}
+
+func confirmBottomFormation(history []float64) bool {
+	if len(history) < 5 {
+		return false
+	}
+	n := len(history)
+	return history[n-3] < history[n-4] &&
+		history[n-2] > history[n-3] &&
+		history[n-1] > history[n-2]
 }
 
 func (s *StrategyEngine) ShouldSell(price, buyPrice float64, history []float64) bool {
@@ -98,60 +90,99 @@ func (s *StrategyEngine) ShouldSell(price, buyPrice float64, history []float64) 
 		return false
 	}
 
-	emaShort := s.CalculateEMAShort(history)
-	emaLong := s.CalculateEMALong(history)
-	rsi := s.CalculateRSI(history)
+	netProfit := ((price * (1 - s.CommissionRate)) - (buyPrice * (1 + s.CommissionRate))) / buyPrice
+	holdingTime := time.Since(s.LastBuyTime)
 
-	s.LastEMAShort = emaShort
-	s.LastEMALong = emaLong
-	s.LastRSI = rsi
+	if netProfit < -s.SoftStopLoss && holdingTime > time.Hour {
+		fmt.Printf("[STRATEGY] Stop-loss triggered: %.2f%%\n", netProfit*100)
+		s.LastSellTime = time.Now()
+		s.LastSellProfit = netProfit * 100
+		return true
+	}
 
-	fmt.Printf("[STRATEGY] SELL check: price=%.2f, avgBuyPrice=%.2f, emaShort=%.2f, emaLong=%.2f, rsi=%.2f\n",
-		price, buyPrice, emaShort, emaLong, rsi)
-
-	adjustedProfit := (price * (1 - s.CommissionRate)) - (buyPrice * (1 + s.CommissionRate))
-	profitPct := adjustedProfit / (buyPrice * (1 + s.CommissionRate))
-	heldDuration := time.Since(s.LastBuyTime)
-
-	if s.UseBollinger {
-		_, _, bollUpper := calculateBollingerBands(history, s.BollingerWindow)
-		if price > bollUpper && profitPct > s.MinProfitMargin {
-			fmt.Printf("[STRATEGY] Price above Bollinger upper band + profit: SELL\n")
+	// 💡 Smart condition for max holding: avoid selling too early if trend is good
+	if holdingTime > s.MaxHoldingDuration {
+		features := s.extractFeatures(price, history, buyPrice)
+		if netProfit < 0.01 && features.EMAShort < features.EMALong && features.RSI < 45 {
+			fmt.Printf("[STRATEGY] Weak trend + low profit after max hold\n")
 			s.LastSellTime = time.Now()
-			s.LastSellProfit = profitPct * 100
+			s.LastSellProfit = netProfit * 100
 			return true
 		}
 	}
 
-	if profitPct > s.MinProfitMargin && rsi > 60 {
+	features := s.extractFeatures(price, history, buyPrice)
+	score := s.sellScore(features, netProfit)
+	if score > 1.2 {
 		s.LastSellTime = time.Now()
-		s.LastSellProfit = profitPct * 100
-		fmt.Printf("[STRATEGY] Profit + RSI confirmed: SELL %.2f%%\n", profitPct*100)
-		return true
-	}
-
-	if profitPct < -s.SoftStopLoss && heldDuration > time.Hour {
-		fmt.Printf("[STRATEGY] STOP-LOSS triggered: %.2f%% loss after 1h\n", profitPct*100)
-		s.LastSellTime = time.Now()
-		s.LastSellProfit = profitPct * 100
-		return true
-	}
-
-	if profitPct < 0 && profitPct > -0.005 && heldDuration > 45*time.Minute {
-		fmt.Printf("[STRATEGY] Defensive exit (-0.5%%) after 45m: SELL %.2f%%\n", profitPct*100)
-		s.LastSellTime = time.Now()
-		s.LastSellProfit = profitPct * 100
-		return true
-	}
-
-	if heldDuration > s.MaxHoldingDuration {
-		fmt.Printf("[STRATEGY] Max holding duration exceeded (%.0fm): SELL %.2f%%\n", heldDuration.Minutes(), profitPct*100)
-		s.LastSellTime = time.Now()
-		s.LastSellProfit = profitPct * 100
+		s.LastSellProfit = netProfit * 100
 		return true
 	}
 
 	return false
+}
+
+func (s *StrategyEngine) extractFeatures(price float64, history []float64, refPrice float64) FeatureVector {
+	emaShort := s.CalculateEMAShort(history)
+	emaLong := s.CalculateEMALong(history)
+	rsi := s.CalculateRSI(history)
+
+	bandLower, _, bandUpper := 0.0, 0.0, 0.0
+	if s.UseBollinger {
+		bandLower, _, bandUpper = CalculateBollingerBands(history, s.BollingerWindow)
+	}
+
+	gap := 0.0
+	if refPrice > 0 {
+		gap = (price - refPrice) / refPrice
+	}
+	return FeatureVector{
+		Price:       price,
+		EMAShort:    emaShort,
+		EMALong:     emaLong,
+		RSI:         rsi,
+		BandLower:   bandLower,
+		BandUpper:   bandUpper,
+		BandWidth:   bandUpper - bandLower,
+		LastSellGap: gap,
+		TimeOK:      time.Since(s.LastSellTime) > 3*time.Minute || s.LastSellProfit >= 0.5,
+	}
+}
+
+func (s *StrategyEngine) buyScore(f FeatureVector) float64 {
+	score := 0.0
+	if f.EMAShort > f.EMALong {
+		score += 1.0
+	}
+	if f.Price < f.BandLower*1.02 {
+		score += 0.8
+	}
+	if f.RSI > 50 {
+		score += 0.5
+	}
+	if f.LastSellGap > s.MinTradeGapPercent {
+		score += 0.4
+	}
+	if f.TimeOK {
+		score += 0.5
+	}
+	fmt.Printf("[SCORE][BUY] price=%.2f ema=%.2f/%.2f rsi=%.2f bandL=%.2f score=%.2f\n",
+		f.Price, f.EMAShort, f.EMALong, f.RSI, f.BandLower, score)
+	return score
+}
+
+func (s *StrategyEngine) sellScore(f FeatureVector, profit float64) float64 {
+	score := 0.0
+	if f.Price > f.BandUpper*0.98 {
+		score += 0.8
+	}
+	if f.RSI > 60 {
+		score += 0.5
+	}
+	if profit > s.MinProfitMargin {
+		score += 0.5
+	}
+	return score
 }
 
 func (s *StrategyEngine) CalculateEMAShort(history []float64) float64 {
@@ -198,7 +229,7 @@ func calculateRSI(data []float64, window int) float64 {
 	return 100 - (100 / (1 + rs))
 }
 
-func calculateBollingerBands(data []float64, window int) (float64, float64, float64) {
+func CalculateBollingerBands(data []float64, window int) (float64, float64, float64) {
 	if len(data) < window {
 		return 0, 0, 0
 	}

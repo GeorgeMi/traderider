@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	_ "github.com/mattn/go-sqlite3"
+	"time"
 )
 
 type Store struct {
@@ -24,6 +25,7 @@ func NewStore(path string) (*Store, error) {
         price REAL,
         time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );`
+
 	_, err = db.Exec(schema)
 	if err != nil {
 		return nil, err
@@ -33,12 +35,13 @@ func NewStore(path string) (*Store, error) {
 }
 
 func (s *Store) LogTransaction(symbol, side string, amount, price float64) error {
-	_, err := s.DB.Exec("INSERT INTO transactions (symbol, side, amount, price) VALUES (?, ?, ?, ?)",
-		symbol, side, amount, price)
+	_, err := s.DB.Exec(`
+        INSERT INTO transactions (symbol, side, amount, price, time) 
+        VALUES (?, ?, ?, ?, ?)
+    `, symbol, side, amount, price, time.Now())
 	return err
 }
 
-// GetLastBuyTransaction returns the most recent BUY transaction for a given symbol.
 func (s *Store) GetLastBuyTransaction(symbol string) (float64, float64, error) {
 	row := s.DB.QueryRow(`
         SELECT amount, price 
@@ -54,4 +57,36 @@ func (s *Store) GetLastBuyTransaction(symbol string) (float64, float64, error) {
 		return 0, 0, err
 	}
 	return amount, price, nil
+}
+
+func (s *Store) GetTransactions(symbol string, limit int) ([]Transaction, error) {
+	rows, err := s.DB.Query(`
+        SELECT side, amount, price, time
+        FROM transactions
+        WHERE symbol = ?
+        ORDER BY time DESC
+        LIMIT ?
+    `, symbol, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []Transaction
+	for rows.Next() {
+		var t Transaction
+		err := rows.Scan(&t.Side, &t.Amount, &t.Price, &t.Time)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, t)
+	}
+	return result, nil
+}
+
+type Transaction struct {
+	Side   string
+	Amount float64
+	Price  float64
+	Time   time.Time
 }
